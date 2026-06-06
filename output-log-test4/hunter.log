@@ -1,0 +1,52 @@
+2026-06-06 13:11:03,792 [INFO] 程序启动。platform=Windows python=3.11.0 argv=D:\tmp\anjian\pj\st\test\2026-06-02\home\nginx\var\log\nginx\2026-06-02\barmyy-manage.access.log --once --output-dir D:\tmp\anjian\pj\st\tmp\nginxlisten\output-log-test4
+2026-06-06 13:11:03,793 [INFO] 日志文件: D:\tmp\anjian\pj\st\tmp\nginxlisten\output-log-test4\hunter.log
+2026-06-06 13:11:03,794 [INFO] 配置已持久化: C:\Users\Administrator\AppData\Roaming\nginx_trace_hunter\config.json
+2026-06-06 13:11:03,794 [INFO] 开始分析。mode=once inputs=D:\tmp\anjian\pj\st\test\2026-06-02\home\nginx\var\log\nginx\2026-06-02\barmyy-manage.access.log
+2026-06-06 13:11:03,794 [INFO] 开始发现日志文件。
+2026-06-06 13:11:03,794 [INFO] 目录内直接发现 access log 1 个。
+2026-06-06 13:11:03,796 [INFO] 发现日志文件 1 个。
+2026-06-06 13:11:03,796 [INFO] 发现 nginx/location 候选 0 个。
+2026-06-06 13:11:03,796 [INFO] 第一遍扫描开始: D:\tmp\anjian\pj\st\test\2026-06-02\home\nginx\var\log\nginx\2026-06-02\barmyy-manage.access.log
+2026-06-06 13:11:05,644 [INFO] 第一遍扫描进度: file=D:\tmp\anjian\pj\st\test\2026-06-02\home\nginx\var\log\nginx\2026-06-02\barmyy-manage.access.log lines=10000 kept=9999 failed=0
+2026-06-06 13:11:07,222 [INFO] 第一遍扫描进度: file=D:\tmp\anjian\pj\st\test\2026-06-02\home\nginx\var\log\nginx\2026-06-02\barmyy-manage.access.log lines=20000 kept=19999 failed=0
+2026-06-06 13:11:08,777 [INFO] 第一遍扫描进度: file=D:\tmp\anjian\pj\st\test\2026-06-02\home\nginx\var\log\nginx\2026-06-02\barmyy-manage.access.log lines=30000 kept=29999 failed=0
+2026-06-06 13:11:08,845 [INFO] 第一遍扫描结束: D:\tmp\anjian\pj\st\test\2026-06-02\home\nginx\var\log\nginx\2026-06-02\barmyy-manage.access.log 当前有效记录=30557
+2026-06-06 13:11:08,845 [INFO] 第二遍异常检测开始: D:\tmp\anjian\pj\st\test\2026-06-02\home\nginx\var\log\nginx\2026-06-02\barmyy-manage.access.log
+2026-06-06 13:11:09,542 [INFO] 第二遍异常检测进度: file=D:\tmp\anjian\pj\st\test\2026-06-02\home\nginx\var\log\nginx\2026-06-02\barmyy-manage.access.log lines=10000 anomalies=56
+2026-06-06 13:11:10,283 [INFO] 第二遍异常检测进度: file=D:\tmp\anjian\pj\st\test\2026-06-02\home\nginx\var\log\nginx\2026-06-02\barmyy-manage.access.log lines=20000 anomalies=66
+2026-06-06 13:11:11,324 [INFO] 第二遍异常检测进度: file=D:\tmp\anjian\pj\st\test\2026-06-02\home\nginx\var\log\nginx\2026-06-02\barmyy-manage.access.log lines=30000 anomalies=83
+2026-06-06 13:11:11,408 [INFO] 第二遍异常检测结束: D:\tmp\anjian\pj\st\test\2026-06-02\home\nginx\var\log\nginx\2026-06-02\barmyy-manage.access.log 当前异常样本=83
+2026-06-06 13:11:11,408 [INFO] 异常检测完成。保留异常样本 83 条。
+2026-06-06 13:11:13,056 [INFO] 分析完成。有效记录=30557 top_ip=120.234.61.168
+2026-06-06 13:39:15,421 [INFO] 程序启动。platform=Windows python=3.11.0 argv=--cfg C:\Users\Administrator\AppData\Roaming\nginx_trace_hunter\config.json
+2026-06-06 13:39:15,422 [INFO] 日志文件: D:\tmp\anjian\pj\st\tmp\nginxlisten\output-log-test4\hunter.log
+2026-06-06 13:39:15,424 [INFO] 配置已持久化: C:\Users\Administrator\AppData\Roaming\nginx_trace_hunter\config.json
+2026-06-06 13:39:15,426 [INFO] 驻场第 1 轮开始。
+2026-06-06 13:39:15,426 [INFO] 执行完整日志发现。
+2026-06-06 13:39:15,426 [INFO] 开始发现日志文件。
+2026-06-06 13:39:15,427 [INFO] 目录内直接发现 access log 1 个。
+2026-06-06 13:39:15,427 [INFO] 检查增量日志: D:\tmp\anjian\pj\st\test\2026-06-02\home\nginx\var\log\nginx\2026-06-02\barmyy-manage.access.log
+2026-06-06 13:39:15,453 [INFO] 生成增量批文件: D:\tmp\anjian\pj\st\tmp\nginxlisten\output-log-test4\_agent_batch\20260606_133915\0000\barmyy-manage.access.log bytes=16324680
+2026-06-06 13:39:15,456 [INFO] 状态已保存: D:\tmp\anjian\pj\st\tmp\nginxlisten\output-once-test\hunter_agent.json
+2026-06-06 13:39:15,456 [INFO] 开始分析。mode=once inputs=D:\tmp\anjian\pj\st\tmp\nginxlisten\output-log-test4\_agent_batch\20260606_133915\0000\barmyy-manage.access.log
+2026-06-06 13:39:15,457 [INFO] 开始发现日志文件。
+2026-06-06 13:39:15,458 [INFO] 目录内直接发现 access log 1 个。
+2026-06-06 13:39:15,458 [INFO] 发现日志文件 1 个。
+2026-06-06 13:39:15,459 [INFO] 发现 nginx/location 候选 0 个。
+2026-06-06 13:39:15,459 [INFO] 第一遍扫描开始: D:\tmp\anjian\pj\st\tmp\nginxlisten\output-log-test4\_agent_batch\20260606_133915\0000\barmyy-manage.access.log
+2026-06-06 13:39:16,223 [INFO] 第一遍扫描进度: file=D:\tmp\anjian\pj\st\tmp\nginxlisten\output-log-test4\_agent_batch\20260606_133915\0000\barmyy-manage.access.log lines=10000 kept=9999 failed=0
+2026-06-06 13:39:17,432 [INFO] 第一遍扫描进度: file=D:\tmp\anjian\pj\st\tmp\nginxlisten\output-log-test4\_agent_batch\20260606_133915\0000\barmyy-manage.access.log lines=20000 kept=19999 failed=0
+2026-06-06 13:39:18,463 [INFO] 第一遍扫描进度: file=D:\tmp\anjian\pj\st\tmp\nginxlisten\output-log-test4\_agent_batch\20260606_133915\0000\barmyy-manage.access.log lines=30000 kept=29999 failed=0
+2026-06-06 13:39:18,517 [INFO] 第一遍扫描结束: D:\tmp\anjian\pj\st\tmp\nginxlisten\output-log-test4\_agent_batch\20260606_133915\0000\barmyy-manage.access.log 当前有效记录=30557
+2026-06-06 13:39:18,518 [INFO] 第二遍异常检测开始: D:\tmp\anjian\pj\st\tmp\nginxlisten\output-log-test4\_agent_batch\20260606_133915\0000\barmyy-manage.access.log
+2026-06-06 13:39:19,205 [INFO] 第二遍异常检测进度: file=D:\tmp\anjian\pj\st\tmp\nginxlisten\output-log-test4\_agent_batch\20260606_133915\0000\barmyy-manage.access.log lines=10000 anomalies=56
+2026-06-06 13:39:19,901 [INFO] 第二遍异常检测进度: file=D:\tmp\anjian\pj\st\tmp\nginxlisten\output-log-test4\_agent_batch\20260606_133915\0000\barmyy-manage.access.log lines=20000 anomalies=66
+2026-06-06 13:39:20,420 [INFO] 第二遍异常检测进度: file=D:\tmp\anjian\pj\st\tmp\nginxlisten\output-log-test4\_agent_batch\20260606_133915\0000\barmyy-manage.access.log lines=30000 anomalies=83
+2026-06-06 13:39:20,444 [INFO] 第二遍异常检测结束: D:\tmp\anjian\pj\st\tmp\nginxlisten\output-log-test4\_agent_batch\20260606_133915\0000\barmyy-manage.access.log 当前异常样本=83
+2026-06-06 13:39:20,444 [INFO] 异常检测完成。保留异常样本 83 条。
+2026-06-06 13:39:21,207 [INFO] 触发 AI 研判。
+2026-06-06 13:39:59,925 [INFO] 分析完成。有效记录=30557 top_ip=120.234.61.168
+2026-06-06 13:40:00,195 [INFO] 告警推送 channel=ding ok=True detail={"errcode":0,"errmsg":"ok"}
+2026-06-06 13:40:00,196 [INFO] 状态已保存: D:\tmp\anjian\pj\st\tmp\nginxlisten\output-once-test\hunter_agent.json
+2026-06-06 13:40:00,196 [INFO] 驻场第 1 轮结束。
+2026-06-06 13:44:13,977 [INFO] 用户中断。

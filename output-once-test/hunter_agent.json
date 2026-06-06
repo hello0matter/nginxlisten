@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "mode": "resident",
+  "roots": [
+    "D:\\tmp\\anjian\\pj\\st\\test\\2026-06-02\\home\\nginx\\var\\log\\nginx\\2026-06-02\\barmyy-manage.access.log"
+  ],
+  "search_roots": [],
+  "known_logs": {
+    "D:\\tmp\\anjian\\pj\\st\\test\\2026-06-02\\home\\nginx\\var\\log\\nginx\\2026-06-02\\barmyy-manage.access.log": {
+      "offset": 16324680,
+      "size": 16324680,
+      "service": "barmyy-manage",
+      "last_seen": "2026-06-06T13:39:15.454680+08:00",
+      "bootstrap_from_tail": false
+    }
+  },
+  "last_cycle": "2026-06-06T13:40:00.195511+08:00",
+  "interval_sec": 600,
+  "last_alert_key": "120.234.61.168|/nh_api/Approval/Apply/GetApplyRecordContextbyApplyId|104.4",
+  "last_alert_results": [
+    {
+      "channel": "ding",
+      "ok": true,
+      "detail": "{\"errcode\":0,\"errmsg\":\"ok\"}"
+    }
+  ]
+}
