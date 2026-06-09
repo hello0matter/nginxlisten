@@ -22,6 +22,7 @@ cp /src/nginx_trace_hunter.py /tmp/nthpkg/nginx-trace-hunter-linux-portable/
 cp /src/README.md /tmp/nthpkg/nginx-trace-hunter-linux-portable/ 2>/dev/null || true
 cp /src/config.example.linux.json /tmp/nthpkg/nginx-trace-hunter-linux-portable/ 2>/dev/null || true
 cp /src/linux_setup.sh /tmp/nthpkg/nginx-trace-hunter-linux-portable/ 2>/dev/null || true
+cp /src/linux_manage.sh /tmp/nthpkg/nginx-trace-hunter-linux-portable/ 2>/dev/null || true
 
 cat > /tmp/nthpkg/nginx-trace-hunter-linux-portable/nginx-trace-hunter <<'EOF'
 #!/usr/bin/env bash
@@ -44,6 +45,7 @@ chmod +x \
   /tmp/nthpkg/nginx-trace-hunter-linux-portable/nginx-trace-hunter \
   /tmp/nthpkg/nginx-trace-hunter-linux-portable/run-resident.sh \
   /tmp/nthpkg/nginx-trace-hunter-linux-portable/linux_setup.sh \
+  /tmp/nthpkg/nginx-trace-hunter-linux-portable/linux_manage.sh \
   /tmp/nthpkg/nginx-trace-hunter-linux-portable/python/bin/python*
 
 tar -C /tmp/nthpkg -czf /src/dist/nginx-trace-hunter-linux-portable.tar.gz nginx-trace-hunter-linux-portable
