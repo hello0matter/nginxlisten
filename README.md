@@ -192,6 +192,8 @@ AI 是辅助总结，不是基础扫描引擎：
 - Windows：`%APPDATA%\nginx_trace_hunter\config.json`
 - Linux：`~/.config/nginx_trace_hunter/config.json`
 
+GUI、命令行默认启动和后台安装脚本会优先使用同一份系统配置；如果安装脚本发现该配置已存在，默认直接复用，不覆盖已有 Webhook。
+
 状态文件和配置文件分开：
 
 - 配置文件保存“想怎么跑”：路径、日期、告警、AI、Webhook 等。

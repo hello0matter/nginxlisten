@@ -3,6 +3,7 @@ param(
     [string]$LogDir = "",
     [string]$OutputDir = "",
     [string]$Interval = "30",
+    [string]$ConfigFile = "",
     [switch]$NoStart,
     [switch]$Uninstall
 )
@@ -11,7 +12,13 @@ $ErrorActionPreference = "Stop"
 
 $AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Exe = Join-Path $AppDir "nginx-trace-hunter-server.exe"
-$ConfigFile = Join-Path $AppDir "config.json"
+if ([string]::IsNullOrWhiteSpace($ConfigFile)) {
+    $AppData = [Environment]::GetFolderPath("ApplicationData")
+    if ([string]::IsNullOrWhiteSpace($AppData)) {
+        $AppData = [Environment]::GetFolderPath("LocalApplicationData")
+    }
+    $ConfigFile = Join-Path $AppData "nginx_trace_hunter\config.json"
+}
 
 function Ask-Value([string]$Prompt, [string]$Default) {
     $value = Read-Host "$Prompt [$Default]"
@@ -39,48 +46,60 @@ if (-not (Test-Path $Exe)) {
     throw "Executable not found: $Exe. Put this script in the same directory as nginx-trace-hunter-server.exe."
 }
 
-if ([string]::IsNullOrWhiteSpace($LogDir)) {
-    $LogDir = Ask-Value -Prompt 'Nginx log directory' -Default 'D:\nginx\logs'
-}
-if ([string]::IsNullOrWhiteSpace($OutputDir)) {
-    $OutputDir = Ask-Value -Prompt 'Output directory' -Default 'D:\nginx-trace-hunter\output'
-}
-if ([string]::IsNullOrWhiteSpace($Interval)) {
-    $Interval = Ask-Value -Prompt 'Polling interval seconds' -Default '30'
+if ((Test-Path $ConfigFile) -and [string]::IsNullOrWhiteSpace($LogDir) -and [string]::IsNullOrWhiteSpace($OutputDir) -and (Ask-YesNo -Prompt "Found existing config $ConfigFile, use it directly" -Default "Y")) {
+    $stored = Get-Content $ConfigFile -Raw | ConvertFrom-Json
+    $OutputDir = [string]$stored.output_dir
+    if ([string]::IsNullOrWhiteSpace($OutputDir)) {
+        $OutputDir = 'D:\nginx-trace-hunter\output'
+    }
+    Write-Host "Using existing config: $ConfigFile"
+} else {
+    if ([string]::IsNullOrWhiteSpace($LogDir)) {
+        $LogDir = Ask-Value -Prompt 'Nginx log directory' -Default 'D:\nginx\logs'
+    }
+    if ([string]::IsNullOrWhiteSpace($OutputDir)) {
+        $OutputDir = Ask-Value -Prompt 'Output directory' -Default 'D:\nginx-trace-hunter\output'
+    }
+    if ([string]::IsNullOrWhiteSpace($Interval)) {
+        $Interval = Ask-Value -Prompt 'Polling interval seconds' -Default '30'
+    }
+
+    $StateFile = Join-Path (Split-Path -Parent $OutputDir) "state.json"
+    New-Item -ItemType Directory -Force (Split-Path -Parent $ConfigFile) | Out-Null
+    New-Item -ItemType Directory -Force $OutputDir | Out-Null
+    New-Item -ItemType Directory -Force (Split-Path -Parent $StateFile) | Out-Null
+
+    $config = [ordered]@{
+        inputs = @($LogDir)
+        search_roots = @()
+        output_dir = $OutputDir
+        state_file = $StateFile
+        top_n = 20
+        from_date = ""
+        to_date = ""
+        archive_mode = "auto"
+        mode = "resident"
+        interval_sec = [int]$Interval
+        bootstrap_bytes = 67108864
+        discover_every = 12
+        ai_enabled = $false
+        ai_base_url = ""
+        ai_model = ""
+        ai_api_key = ""
+        ai_prompt = ""
+        alert_enabled = $false
+        alert_min_score = 30.0
+        ding_url = ""
+        ding_kw = ""
+        wx_url = ""
+        fs_url = ""
+    }
+
+    $config | ConvertTo-Json -Depth 5 | Set-Content -Encoding UTF8 $ConfigFile
+    Write-Host "Config generated: $ConfigFile"
 }
 
-$StateFile = Join-Path (Split-Path -Parent $OutputDir) "state.json"
 New-Item -ItemType Directory -Force $OutputDir | Out-Null
-New-Item -ItemType Directory -Force (Split-Path -Parent $StateFile) | Out-Null
-
-$config = [ordered]@{
-    inputs = @($LogDir)
-    search_roots = @()
-    output_dir = $OutputDir
-    state_file = $StateFile
-    top_n = 20
-    from_date = ""
-    to_date = ""
-    archive_mode = "auto"
-    mode = "resident"
-    interval_sec = [int]$Interval
-    bootstrap_bytes = 67108864
-    discover_every = 12
-    ai_enabled = $false
-    ai_base_url = ""
-    ai_model = ""
-    ai_api_key = ""
-    ai_prompt = ""
-    alert_enabled = $false
-    alert_min_score = 30.0
-    ding_url = ""
-    ding_kw = ""
-    wx_url = ""
-    fs_url = ""
-}
-
-$config | ConvertTo-Json -Depth 5 | Set-Content -Encoding UTF8 $ConfigFile
-Write-Host "Config generated: $ConfigFile"
 
 $InstallTask = Ask-YesNo -Prompt 'Install as startup background scheduled task' -Default 'Y'
 if (-not $InstallTask) {

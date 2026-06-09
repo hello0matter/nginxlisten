@@ -3,7 +3,8 @@ set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXE="$APP_DIR/nginx-trace-hunter"
-CONFIG_FILE="${CONFIG_FILE:-$APP_DIR/config.json}"
+DEFAULT_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nginx_trace_hunter"
+CONFIG_FILE="${CONFIG_FILE:-$DEFAULT_CONFIG_DIR/config.json}"
 
 if [[ ! -x "$EXE" ]]; then
   echo "Executable not found: $EXE" >&2
@@ -27,15 +28,36 @@ ask_yes_no() {
   [[ "$value" =~ ^[Yy] ]]
 }
 
-LOG_DIR="$(ask 'Nginx 日志目录' '/var/log/nginx')"
-OUTPUT_DIR="$(ask '输出目录' "$APP_DIR/output")"
-STATE_FILE="$(ask '状态文件' "$APP_DIR/state.json")"
-INTERVAL="$(ask '轮询间隔秒' '30')"
-ALERT_MIN="$(ask '告警阈值' '30')"
+json_get() {
+  local key="$1"
+  "$APP_DIR/python/bin/python3" - "$CONFIG_FILE" "$key" <<'PY'
+import json, sys
+path, key = sys.argv[1], sys.argv[2]
+try:
+    with open(path, "r", encoding="utf-8-sig") as f:
+        data = json.load(f)
+except FileNotFoundError:
+    data = {}
+print(data.get(key, ""))
+PY
+}
 
-mkdir -p "$OUTPUT_DIR" "$(dirname "$STATE_FILE")"
+if [[ -f "$CONFIG_FILE" ]] && ask_yes_no "发现系统配置 $CONFIG_FILE，是否直接使用" "y"; then
+  OUTPUT_DIR="$(json_get output_dir)"
+  if [[ -z "$OUTPUT_DIR" ]]; then
+    OUTPUT_DIR="$APP_DIR/output"
+  fi
+  echo "使用已有配置: $CONFIG_FILE"
+else
+  LOG_DIR="$(ask 'Nginx 日志目录' '/var/log/nginx')"
+  OUTPUT_DIR="$(ask '输出目录' "$APP_DIR/output")"
+  STATE_FILE="$(ask '状态文件' "$APP_DIR/state.json")"
+  INTERVAL="$(ask '轮询间隔秒' '30')"
+  ALERT_MIN="$(ask '告警阈值' '30')"
 
-cat > "$CONFIG_FILE" <<EOF
+  mkdir -p "$(dirname "$CONFIG_FILE")" "$OUTPUT_DIR" "$(dirname "$STATE_FILE")"
+
+  cat > "$CONFIG_FILE" <<EOF
 {
   "inputs": [
     "$LOG_DIR"
@@ -65,7 +87,10 @@ cat > "$CONFIG_FILE" <<EOF
 }
 EOF
 
-echo "配置已生成: $CONFIG_FILE"
+  echo "配置已生成: $CONFIG_FILE"
+fi
+
+mkdir -p "$OUTPUT_DIR"
 
 if ask_yes_no "是否安装为 systemd 服务" "y"; then
   if [[ "$(id -u)" -ne 0 ]]; then
