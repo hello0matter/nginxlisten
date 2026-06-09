@@ -74,6 +74,8 @@ TEXT_SEARCH_EXTS = {
 }
 ARCHIVE_SUFFIXES = (".zip", ".tar", ".tgz", ".tar.gz", ".gz", ".7z", ".rar")
 SCAN_PROGRESS_LINES = 10000
+ALERT_DEDUPE_TTL_SECONDS = 24 * 60 * 60
+ALERT_HISTORY_MAX = 1000
 SCAN_KEYWORDS = (
     "/admin",
     "/manage",
@@ -99,38 +101,169 @@ SCAN_KEYWORDS = (
 IDOR_PATH_KEYWORDS = (
     "admin",
     "manage",
+    "manager",
+    "backend",
+    "console",
+    "tenant",
+    "org",
+    "organization",
+    "company",
+    "corp",
+    "enterprise",
     "user",
+    "users",
     "member",
+    "customer",
+    "client",
+    "staff",
+    "employee",
+    "operator",
     "account",
     "profile",
+    "person",
+    "personal",
+    "identity",
+    "idcard",
+    "cert",
     "patient",
+    "patients",
+    "pat",
     "doctor",
+    "nurse",
+    "hospital",
+    "clinic",
+    "medical",
+    "health",
+    "diagnosis",
+    "consult",
+    "consultation",
+    "appointment",
+    "appoint",
+    "register",
+    "registration",
+    "queue",
+    "prescription",
+    "recipe",
+    "medicine",
+    "drug",
+    "exam",
+    "inspect",
+    "inspection",
+    "lab",
+    "lis",
+    "pacs",
+    "emr",
+    "ehr",
+    "case",
+    "casehistory",
+    "admission",
+    "discharge",
     "order",
+    "orders",
+    "trade",
+    "payment",
+    "pay",
+    "refund",
+    "wallet",
     "bill",
     "invoice",
     "record",
+    "records",
+    "log",
+    "history",
     "visit",
     "apply",
+    "application",
     "approval",
+    "approve",
+    "audit",
+    "workflow",
+    "process",
+    "task",
+    "todo",
     "project",
     "dept",
+    "department",
     "role",
+    "roles",
     "permission",
+    "permissions",
+    "privilege",
+    "privileges",
+    "authz",
+    "acl",
+    "scope",
     "menu",
     "file",
+    "files",
+    "attachment",
+    "attach",
+    "image",
+    "photo",
+    "avatar",
+    "document",
+    "doc",
     "report",
+    "reports",
+    "message",
+    "messages",
+    "msg",
+    "notice",
+    "notification",
+    "chat",
+    "im",
+    "comment",
+    "address",
+    "contact",
+    "phone",
+    "mobile",
+    "email",
+    "mail",
+    "card",
+    "coupon",
+    "ticket",
+    "contract",
+    "sign",
+    "signature",
     "detail",
     "info",
     "api",
 )
-LIST_ENDPOINT_KEYWORDS = ("list", "search", "query", "page", "select", "tree", "getall", "getuserlist")
+LIST_ENDPOINT_KEYWORDS = (
+    "list",
+    "search",
+    "query",
+    "page",
+    "select",
+    "tree",
+    "table",
+    "grid",
+    "options",
+    "items",
+    "records",
+    "messages",
+    "notices",
+    "notifications",
+    "getall",
+    "getlist",
+    "getpage",
+    "gettree",
+    "getoptions",
+    "getitems",
+    "getrecords",
+    "getmessages",
+    "getusermessage",
+    "getuserlist",
+    "getpatientlist",
+    "patientlist",
+)
 MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 DEFAULT_AI_PROMPT = (
     "你是一名经验丰富的应急响应分析师。请根据 nginx 日志聚合结果输出精炼研判："
     "攻击方式、攻击是否疑似成功、后续核查建议、需要优先保护的接口。"
 )
 SENSITIVE_PARAM_RE = re.compile(
-    r"(?:^|_)(?:id|uid|userid|user_id|applyid|apply_id|projectid|project_id|patientid|patient_id|patid|orderid|order_id|recordid|record_id|docid|doc_id|pid|sid|accountid|account_id|memberid|member_id|deptid|dept_id|roleid|role_id|menuid|menu_id|invoiceid|invoice_id|billid|bill_id|visitid|visit_id|admno|admid|cardno|sfzh)$",
+    r"(?:^|_)(?:id|uid|userid|user_id|openid|open_id|unionid|union_id|tenantid|tenant_id|orgid|org_id|companyid|company_id|applyid|apply_id|approvalid|approval_id|taskid|task_id|workflowid|workflow_id|processid|process_id|projectid|project_id|patientid|patient_id|patid|doctorid|doctor_id|nurseid|nurse_id|hospitalid|hospital_id|clinicid|clinic_id|appointid|appoint_id|appointmentid|appointment_id|registerid|register_id|visitid|visit_id|orderid|order_id|tradeid|trade_id|paymentid|payment_id|payid|pay_id|refundid|refund_id|recordid|record_id|caseid|case_id|emrid|emr_id|ehrid|ehr_id|reportid|report_id|messageid|message_id|msgid|msg_id|noticeid|notice_id|chatid|chat_id|commentid|comment_id|fileid|file_id|attachid|attach_id|attachmentid|attachment_id|imageid|image_id|photoid|photo_id|docid|doc_id|documentid|document_id|pid|sid|accountid|account_id|memberid|member_id|customerid|customer_id|clientid|client_id|staffid|staff_id|employeeid|employee_id|operatorid|operator_id|deptid|dept_id|departmentid|department_id|roleid|role_id|permissionid|permission_id|menuid|menu_id|invoiceid|invoice_id|billid|bill_id|addressid|address_id|cardid|card_id|couponid|coupon_id|ticketid|ticket_id|contractid|contract_id|admno|admid|cardno|sfzh|phone|mobile|tel|email)$",
     re.IGNORECASE,
 )
 TEXT_ENCODING_CANDIDATES = ("utf-8", "gb18030", "gbk", "latin-1")
@@ -2131,6 +2264,35 @@ class ResidentAgent:
         log_info(f"驻场第 {cycle_index} 轮结束。")
         return report
 
+    def alert_fingerprint(self, top_ip: dict[str, Any], top_uri: dict[str, Any]) -> str:
+        uri_path = str(top_uri.get("uri_path") or "").strip()
+        if uri_path and uri_path != "-":
+            risk_category = str(top_uri.get("risk_category") or "unknown").strip()
+            return f"uri|{uri_path}|{risk_category}"
+        ip = str(top_ip.get("ip") or "-").strip()
+        risk_category = str(top_ip.get("risk_category") or "unknown").strip()
+        return f"ip|{ip}|{risk_category}"
+
+    def alert_history(self, state: dict[str, Any], now_ts: int) -> dict[str, Any]:
+        raw_history = state.get("alert_history")
+        history = raw_history if isinstance(raw_history, dict) else {}
+        cutoff = now_ts - ALERT_DEDUPE_TTL_SECONDS * 7
+        pruned = {}
+        for key, value in history.items():
+            if not isinstance(value, dict):
+                continue
+            try:
+                last_sent = int(value.get("last_sent", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if last_sent >= cutoff:
+                pruned[key] = value
+        if len(pruned) > ALERT_HISTORY_MAX:
+            items = sorted(pruned.items(), key=lambda item: int(item[1].get("last_sent", 0) or 0), reverse=True)
+            pruned = dict(items[:ALERT_HISTORY_MAX])
+        state["alert_history"] = pruned
+        return pruned
+
     def send_alert_if_needed(self, report: dict[str, Any], state: dict[str, Any]) -> None:
         if not self.config.alert_enabled:
             log_info("告警未启用，跳过推送。")
@@ -2141,9 +2303,25 @@ class ResidentAgent:
         if score < self.config.alert_min_score:
             log_info(f"未达到告警阈值。score={score} threshold={self.config.alert_min_score}")
             return
+        now_ts = int(time.time())
         alert_key = f"{top_ip.get('ip','-')}|{top_uri.get('uri_path','-')}|{score}"
         if state.get("last_alert_key") == alert_key:
             log_info("告警去重命中，跳过重复推送。")
+            return
+        fingerprint = self.alert_fingerprint(top_ip, top_uri)
+        history = self.alert_history(state, now_ts)
+        previous = history.get(fingerprint) or {}
+        previous_ts = int(previous.get("last_sent", 0) or 0) if isinstance(previous, dict) else 0
+        if previous_ts and now_ts - previous_ts < ALERT_DEDUPE_TTL_SECONDS:
+            remaining = ALERT_DEDUPE_TTL_SECONDS - (now_ts - previous_ts)
+            log_info(f"告警接口冷却命中，跳过重复推送。fingerprint={fingerprint} remaining={remaining}s")
+            state["last_alert_suppressed"] = {
+                "fingerprint": fingerprint,
+                "score": score,
+                "suppressed_at": now_ts,
+                "previous_sent": previous_ts,
+                "remaining_seconds": remaining,
+            }
             return
         text = self.build_alert_text(report, score)
         results = []
@@ -2155,6 +2333,14 @@ class ResidentAgent:
             log_info(f"告警推送 channel={name} ok={ok} detail={detail}")
         state["last_alert_key"] = alert_key
         state["last_alert_results"] = results
+        history[fingerprint] = {
+            "last_sent": now_ts,
+            "score": score,
+            "ip": top_ip.get("ip", "-"),
+            "uri_path": top_uri.get("uri_path", "-"),
+            "risk_category": top_uri.get("risk_category") or top_ip.get("risk_category"),
+            "reason_tags": top_uri.get("reason_tags") or top_ip.get("reason_tags") or [],
+        }
 
     def build_alert_text(self, report: dict[str, Any], score: float) -> str:
         top_ip = (report.get("summary", {}) or {}).get("top_ip") or {}
