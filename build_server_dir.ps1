@@ -37,6 +37,10 @@ if (-not (Test-Path $Exe)) {
     throw "Build failed, exe not found: $Exe"
 }
 
+$AppDir = Join-Path $Dist "nginx-trace-hunter-server"
+Copy-Item (Join-Path $Root "config.example.windows.json") $AppDir -ErrorAction SilentlyContinue
+Copy-Item (Join-Path $Root "README.md") $AppDir -ErrorAction SilentlyContinue
+
 Write-Host "Creating zip package..."
 tar -a -c -f $Package -C $Dist "nginx-trace-hunter-server"
 

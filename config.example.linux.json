@@ -1,0 +1,27 @@
+{
+  "inputs": [
+    "/var/log/nginx"
+  ],
+  "search_roots": [],
+  "output_dir": "/opt/nginx-trace-hunter/output",
+  "state_file": "/opt/nginx-trace-hunter/state.json",
+  "top_n": 20,
+  "from_date": "",
+  "to_date": "",
+  "archive_mode": "auto",
+  "mode": "resident",
+  "interval_sec": 30,
+  "bootstrap_bytes": 67108864,
+  "discover_every": 12,
+  "ai_enabled": false,
+  "ai_base_url": "",
+  "ai_model": "",
+  "ai_api_key": "",
+  "ai_prompt": "",
+  "alert_enabled": false,
+  "alert_min_score": 30.0,
+  "ding_url": "",
+  "ding_kw": "",
+  "wx_url": "",
+  "fs_url": ""
+}

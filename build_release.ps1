@@ -17,7 +17,11 @@ Remove-Item -Force (Join-Path $Dist "nginx-trace-hunter-linux-source.tar.gz") -E
 tar -czf (Join-Path $Dist "nginx-trace-hunter-linux-source.tar.gz") `
     nginx_trace_hunter.py `
     build_linux_centos.sh `
+    build_linux_portable.ps1 `
     install_linux_service.sh `
+    linux_setup.sh `
+    config.example.linux.json `
+    config.example.windows.json `
     README.md
 
 Write-Host ""
@@ -32,7 +36,11 @@ tar -a -c -f (Join-Path $Dist "nginx-trace-hunter-source.zip") `
     build_exe.ps1 `
     build_server_dir.ps1 `
     build_linux_centos.sh `
+    build_linux_portable.ps1 `
     install_linux_service.sh `
+    linux_setup.sh `
+    config.example.linux.json `
+    config.example.windows.json `
     README.md
 
 Write-Host ""
