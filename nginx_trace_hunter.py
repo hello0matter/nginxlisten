@@ -3,14 +3,20 @@
 nginx_trace_hunter.py
 
 面向应急溯源场景的 Nginx 日志智能分析脚本。
+
+默认直接运行会进入驻场增量巡检模式；只做一次历史分析请使用 --once；
+图形化配置请使用 --gui。完整使用说明见同目录 README.md。
 """
 
 from __future__ import annotations
 
 import argparse
+import calendar
 import csv
+import ctypes
 import datetime as dt
 import fnmatch
+import hashlib
 import json
 import logging
 import math
@@ -90,8 +96,41 @@ SCAN_KEYWORDS = (
     "/phpmyadmin",
     "/sql",
 )
+IDOR_PATH_KEYWORDS = (
+    "admin",
+    "manage",
+    "user",
+    "member",
+    "account",
+    "profile",
+    "patient",
+    "doctor",
+    "order",
+    "bill",
+    "invoice",
+    "record",
+    "visit",
+    "apply",
+    "approval",
+    "project",
+    "dept",
+    "role",
+    "permission",
+    "menu",
+    "file",
+    "report",
+    "detail",
+    "info",
+    "api",
+)
+LIST_ENDPOINT_KEYWORDS = ("list", "search", "query", "page", "select", "tree", "getall", "getuserlist")
+MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+DEFAULT_AI_PROMPT = (
+    "你是一名经验丰富的应急响应分析师。请根据 nginx 日志聚合结果输出精炼研判："
+    "攻击方式、攻击是否疑似成功、后续核查建议、需要优先保护的接口。"
+)
 SENSITIVE_PARAM_RE = re.compile(
-    r"(?:^|_)(?:id|uid|userid|applyid|projectid|patientid|orderid|recordid|docid|pid|sid)$",
+    r"(?:^|_)(?:id|uid|userid|user_id|applyid|apply_id|projectid|project_id|patientid|patient_id|patid|orderid|order_id|recordid|record_id|docid|doc_id|pid|sid|accountid|account_id|memberid|member_id|deptid|dept_id|roleid|role_id|menuid|menu_id|invoiceid|invoice_id|billid|bill_id|visitid|visit_id|admno|admid|cardno|sfzh)$",
     re.IGNORECASE,
 )
 TEXT_ENCODING_CANDIDATES = ("utf-8", "gb18030", "gbk", "latin-1")
@@ -121,6 +160,20 @@ LOGGER = logging.getLogger("nginx_trace_hunter")
 
 def eprint(*args: Any) -> None:
     print(*args, file=sys.stderr)
+
+
+def configure_console_encoding() -> None:
+    if os.name == "nt":
+        try:
+            ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+            ctypes.windll.kernel32.SetConsoleCP(65001)
+        except Exception:
+            pass
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 
 def setup_logging(output_dir: Path) -> Path:
@@ -156,6 +209,24 @@ def open_path(path: Path) -> None:
         subprocess.Popen(["open", target])
         return
     subprocess.Popen(["xdg-open", target])
+
+
+def split_path_list(value: str) -> list[str]:
+    parts = re.split(r"[;\r\n]+", value or "")
+    return [item.strip().strip('"') for item in parts if item.strip()]
+
+
+def path_list_text(values: Iterable[Any]) -> str:
+    return "\n".join(str(item) for item in values if str(item).strip())
+
+
+def format_mb(size: int) -> str:
+    return f"{size / (1024 * 1024):.1f}MB"
+
+
+def log_line_fingerprint(line: str) -> str:
+    normalized = line.lstrip("\ufeff").strip()
+    return hashlib.sha1(normalized.encode("utf-8", errors="ignore")).hexdigest()[:16]
 
 
 def safe_read_text(path: Path, size_limit: int = 2 * 1024 * 1024) -> str:
@@ -364,6 +435,8 @@ class IpStats:
     scan_hits: int = 0
     auth_hits: int = 0
     anomaly_hits: int = 0
+    object_access_hits: int = 0
+    mutating_sensitive_hits: int = 0
     sample_events: list[SampleEvent] = field(default_factory=list)
     user_agents: Counter[str] = field(default_factory=Counter)
     referers: Counter[str] = field(default_factory=Counter)
@@ -383,6 +456,8 @@ class UriStats:
     hosts: Counter[str] = field(default_factory=Counter)
     second_counts: dict[str, int] = field(default_factory=dict)
     max_rps: int = 0
+    object_access_hits: int = 0
+    mutating_sensitive_hits: int = 0
     sample_events: list[SampleEvent] = field(default_factory=list)
     distinct_targets: set[str] = field(default_factory=set)
     query_param_names: Counter[str] = field(default_factory=Counter)
@@ -450,6 +525,7 @@ class AnalyzerConfig:
     ai_base_url: Optional[str]
     ai_model: Optional[str]
     ai_api_key: Optional[str]
+    ai_prompt: Optional[str]
     max_search_files: int
     mode: str
     interval_sec: int
@@ -480,6 +556,7 @@ def config_to_persist_dict(config: AnalyzerConfig) -> dict[str, Any]:
         "ai_base_url": config.ai_base_url,
         "ai_model": config.ai_model,
         "ai_api_key": config.ai_api_key,
+        "ai_prompt": config.ai_prompt,
         "max_search_files": config.max_search_files,
         "mode": config.mode,
         "interval_sec": config.interval_sec,
@@ -515,6 +592,14 @@ class NginxTraceHunter:
         self.service_counter: Counter[str] = Counter()
         self.attack_windows: Counter[tuple[str, str]] = Counter()
         self.top_anomalies: list[dict[str, Any]] = []
+        self.file_request_counts: Counter[str] = Counter()
+        self.file_anomaly_counts: Counter[str] = Counter()
+        self.target_request_counts: Counter[str] = Counter()
+        self.target_file_map: dict[str, set[str]] = defaultdict(set)
+        self.monitor_target_cache: dict[str, str] = {}
+        self.timestamp_cache: dict[str, dt.datetime] = {}
+        self.idor_sensitive_cache: dict[str, bool] = {}
+        self.sensitive_list_cache: dict[str, bool] = {}
 
     def run(self) -> dict[str, Any]:
         ensure_dir(self.config.output_dir)
@@ -556,7 +641,8 @@ class NginxTraceHunter:
             log_info("触发 AI 研判。")
             report["ai_judgement"] = self.ask_ai(report)
         self.write_outputs(report)
-        log_info(f"分析完成。有效记录={self.parsed_records} top_ip={(report.get('summary', {}) or {}).get('top_ip', {}).get('ip', '-')}")
+        top_ip = ((report.get("summary", {}) or {}).get("top_ip") or {})
+        log_info(f"分析完成。有效记录={self.parsed_records} top_ip={top_ip.get('ip', '-')}")
         return report
 
     def should_invoke_ai(self, report: dict[str, Any]) -> bool:
@@ -589,7 +675,10 @@ class NginxTraceHunter:
                 continue
             if not root.exists():
                 continue
-            for path in root.rglob("*"):
+            if self.path_is_in_output_dir(root):
+                log_info(f"跳过输出目录自身，避免递归扫描: {root}")
+                continue
+            for path in self.iter_tree_files(root):
                 if path.is_file():
                     if self.is_access_log(path):
                         log_files.append(path)
@@ -598,9 +687,11 @@ class NginxTraceHunter:
 
         if log_files:
             log_info(f"目录内直接发现 access log {len(log_files)} 个。")
-            return sorted(self.filter_by_date(log_files))
 
         if self.config.archive_mode == "never":
+            if log_files:
+                log_info("已禁用归档处理，仅使用直接发现的 access log。")
+                return sorted(self.filter_by_date(log_files))
             log_info("未发现日志，且已禁用归档处理。")
             return []
 
@@ -610,7 +701,7 @@ class NginxTraceHunter:
             for path in root.rglob("*"):
                 if path.is_file() and self.is_access_log(path):
                     log_files.append(path)
-        log_info(f"归档内发现 access log {len(log_files)} 个。")
+        log_info(f"合计发现 access log {len(log_files)} 个。")
         return sorted(self.filter_by_date(log_files))
 
     def discover_nginx_locations(self) -> list[NginxLocation]:
@@ -639,16 +730,51 @@ class NginxTraceHunter:
             locations.extend(self.parse_nginx_conf(conf))
         return locations
 
+    def path_is_in_output_dir(self, path: Path) -> bool:
+        try:
+            resolved = path.resolve()
+            output_dir = self.config.output_dir.resolve()
+            resolved.relative_to(output_dir)
+            return True
+        except Exception:
+            return False
+
+    def iter_tree_files(self, root: Path) -> Iterator[Path]:
+        for dirpath, dirnames, filenames in os.walk(root):
+            current_dir = Path(dirpath)
+            kept_dirs = []
+            for dirname in dirnames:
+                child_dir = current_dir / dirname
+                if self.path_is_in_output_dir(child_dir):
+                    continue
+                kept_dirs.append(dirname)
+            dirnames[:] = kept_dirs
+            for filename in filenames:
+                path = current_dir / filename
+                if self.path_is_in_output_dir(path):
+                    continue
+                yield path
+
     def first_pass(self) -> None:
-        for file_path in self.log_files:
+        total_files = len(self.log_files)
+        stage_started = time.monotonic()
+        for file_index, file_path in enumerate(self.log_files, 1):
             service = file_name_service(file_path)
             self.service_counter[service] += 1
-            log_info(f"第一遍扫描开始: {file_path}")
+            file_size = file_path.stat().st_size
+            file_started = time.monotonic()
+            log_info(f"全量统计阶段开始: [{file_index}/{total_files}] {file_path} size={format_mb(file_size)}")
             line_no = 0
             for raw_line in self.stream_lines(file_path):
                 line_no += 1
                 if line_no % SCAN_PROGRESS_LINES == 0:
-                    log_info(f"第一遍扫描进度: file={file_path} lines={line_no} kept={self.parsed_records} failed={self.failed_records}")
+                    elapsed = max(0.001, time.monotonic() - file_started)
+                    total_elapsed = max(0.001, time.monotonic() - stage_started)
+                    log_info(
+                        f"全量统计阶段进度: [{file_index}/{total_files}] file={file_path.name} "
+                        f"size={format_mb(file_size)} lines={line_no} speed={line_no / elapsed:.0f}l/s "
+                        f"stage_elapsed={total_elapsed:.1f}s kept={self.parsed_records} failed={self.failed_records}"
+                    )
                 self.total_records += 1
                 parsed = self.parse_access_line(raw_line, file_path)
                 if not parsed:
@@ -658,17 +784,31 @@ class NginxTraceHunter:
                     continue
                 self.parsed_records += 1
                 self.consume_record(parsed)
-            log_info(f"第一遍扫描结束: {file_path} 当前有效记录={self.parsed_records}")
+            elapsed = max(0.001, time.monotonic() - file_started)
+            log_info(
+                f"全量统计阶段结束: [{file_index}/{total_files}] {file_path} "
+                f"lines={line_no} speed={line_no / elapsed:.0f}l/s 当前有效记录={self.parsed_records}"
+            )
 
     def second_pass_collect_anomalies(self) -> None:
         anomalies: list[dict[str, Any]] = []
-        for file_path in self.log_files:
-            log_info(f"第二遍异常检测开始: {file_path}")
+        total_files = len(self.log_files)
+        stage_started = time.monotonic()
+        for file_index, file_path in enumerate(self.log_files, 1):
+            file_size = file_path.stat().st_size
+            file_started = time.monotonic()
+            log_info(f"异常复核阶段开始: [{file_index}/{total_files}] {file_path} size={format_mb(file_size)}")
             line_no = 0
             for raw_line in self.stream_lines(file_path):
                 line_no += 1
                 if line_no % SCAN_PROGRESS_LINES == 0:
-                    log_info(f"第二遍异常检测进度: file={file_path} lines={line_no} anomalies={len(anomalies)}")
+                    elapsed = max(0.001, time.monotonic() - file_started)
+                    total_elapsed = max(0.001, time.monotonic() - stage_started)
+                    log_info(
+                        f"异常复核阶段进度: [{file_index}/{total_files}] file={file_path.name} "
+                        f"size={format_mb(file_size)} lines={line_no} speed={line_no / elapsed:.0f}l/s "
+                        f"stage_elapsed={total_elapsed:.1f}s anomalies={len(anomalies)}"
+                    )
                 parsed = self.parse_access_line(raw_line, file_path)
                 if not parsed or not self.keep_record(parsed):
                     continue
@@ -701,7 +841,12 @@ class NginxTraceHunter:
                     }
                 )
                 self.ip_stats[parsed["real_ip"]].anomaly_hits += 1
-            log_info(f"第二遍异常检测结束: {file_path} 当前异常样本={len(anomalies)}")
+                self.file_anomaly_counts[str(file_path)] += 1
+            elapsed = max(0.001, time.monotonic() - file_started)
+            log_info(
+                f"异常复核阶段结束: [{file_index}/{total_files}] {file_path} "
+                f"lines={line_no} speed={line_no / elapsed:.0f}l/s 当前异常样本={len(anomalies)}"
+            )
         anomalies.sort(key=lambda x: (x["body_bytes"], x["timestamp"]), reverse=True)
         self.top_anomalies = anomalies[: max(self.config.top_n * 5, 50)]
         log_info(f"异常检测完成。保留异常样本 {len(self.top_anomalies)} 条。")
@@ -732,6 +877,13 @@ class NginxTraceHunter:
                 score_tags["auth-burst"] = min(10.0, auth_total * 0.2)
             if stats.anomaly_hits:
                 score_tags["large-response"] = min(16.0, stats.anomaly_hits * 1.2)
+            if stats.object_access_hits:
+                score_tags["object-id-access"] = min(18.0, 8.0 + stats.object_access_hits * 0.8)
+            if stats.mutating_sensitive_hits:
+                score_tags["sensitive-mutation"] = min(24.0, 20.0 + stats.mutating_sensitive_hits * 2.0)
+            sensitive_list_hits = sum(count for path, count in stats.paths.items() if self.path_is_sensitive_list_endpoint(path))
+            if sensitive_list_hits >= 5:
+                score_tags["sensitive-list-access"] = min(22.0, 12.0 + sensitive_list_hits * 0.5)
             if focused_hits:
                 score_tags["focus-uri"] = min(20.0, focused_hits * 0.15)
             if five_xx >= 5:
@@ -771,17 +923,23 @@ class NginxTraceHunter:
             total_score = round(sum(score_tags.values()), 2)
             if total_score <= 0:
                 continue
+            reason_tags = summarize_reason_tags(score_tags)
+            risk_category, risk_description = self.classify_risk_tags(reason_tags)
             top_paths = [{"path": path, "count": count} for path, count in stats.paths.most_common(8)]
             ranked.append(
                 {
                     "ip": ip,
                     "score": total_score,
-                    "reason_tags": summarize_reason_tags(score_tags),
+                    "risk_category": risk_category,
+                    "risk_description": risk_description,
+                    "reason_tags": reason_tags,
                     "requests": stats.total,
                     "bytes_total": stats.bytes_total,
                     "max_rps": stats.max_rps,
                     "unique_paths": unique_paths,
                     "unique_targets": unique_targets,
+                    "object_access_hits": stats.object_access_hits,
+                    "mutating_sensitive_hits": stats.mutating_sensitive_hits,
                     "status_top": {str(k): v for k, v in stats.statuses.most_common(6)},
                     "host_top": dict(stats.hosts.most_common(5)),
                     "top_paths": top_paths,
@@ -809,6 +967,12 @@ class NginxTraceHunter:
                 score_tags["multi-source"] = min(10.0, distinct_ips * 0.8)
             if stats.bytes_stats.count >= 10 and self.is_large_response_anomaly(stats.bytes_stats.max_size, stats.bytes_stats):
                 score_tags["large-response-spread"] = 10.0
+            if stats.object_access_hits:
+                score_tags["object-id-access"] = min(18.0, 8.0 + stats.object_access_hits * 0.8)
+            if stats.mutating_sensitive_hits:
+                score_tags["sensitive-mutation"] = min(24.0, 20.0 + stats.mutating_sensitive_hits * 2.0)
+            if self.path_is_sensitive_list_endpoint(uri_path) and (stats.total >= 5 or stats.max_rps >= 5):
+                score_tags["sensitive-list-access"] = min(22.0, 12.0 + stats.total * 0.5 + stats.max_rps * 0.8)
 
             enum_ips = 0
             for (ip, pair_uri), pair in self.ip_uri_stats.items():
@@ -830,17 +994,23 @@ class NginxTraceHunter:
             total_score = round(sum(score_tags.values()), 2)
             if total_score <= 0:
                 continue
+            reason_tags = summarize_reason_tags(score_tags)
+            risk_category, risk_description = self.classify_risk_tags(reason_tags)
             ranked.append(
                 {
                     "uri_path": uri_path,
                     "score": total_score,
-                    "reason_tags": summarize_reason_tags(score_tags),
+                    "risk_category": risk_category,
+                    "risk_description": risk_description,
+                    "reason_tags": reason_tags,
                     "requests": stats.total,
                     "distinct_ips": distinct_ips,
                     "max_rps": stats.max_rps,
                     "mean_body_bytes": int(stats.bytes_stats.mean),
                     "p95_body_bytes": stats.bytes_stats.p95,
                     "max_body_bytes": stats.bytes_stats.max_size,
+                    "object_access_hits": stats.object_access_hits,
+                    "mutating_sensitive_hits": stats.mutating_sensitive_hits,
                     "status_top": {str(k): v for k, v in stats.statuses.most_common(6)},
                     "ip_top": dict(stats.ips.most_common(8)),
                     "host_top": dict(stats.hosts.most_common(5)),
@@ -858,8 +1028,26 @@ class NginxTraceHunter:
             "total_records_seen": self.total_records,
             "parsed_records_kept": self.parsed_records,
             "failed_records": self.failed_records,
+            "files_scanned": len(self.log_files),
             "services_seen": dict(self.service_counter.most_common(20)),
             "dates_seen": dict(self.date_counter.most_common(20)),
+            "top_files": [
+                {
+                    "file": path,
+                    "requests": count,
+                    "anomalies": self.file_anomaly_counts.get(path, 0),
+                }
+                for path, count in self.file_request_counts.most_common(12)
+            ],
+            "monitor_targets": [
+                {
+                    "target": target,
+                    "requests": count,
+                    "files": len(self.target_file_map.get(target, set())),
+                    "sample_files": sorted(self.target_file_map.get(target, set()))[:5],
+                }
+                for target, count in self.target_request_counts.most_common(20)
+            ],
             "hot_windows": [
                 {"time_bucket": bucket, "uri_path": uri, "count": count}
                 for (bucket, uri), count in self.attack_windows.most_common(self.config.top_n)
@@ -904,8 +1092,16 @@ class NginxTraceHunter:
         review_csv = self.config.output_dir / "review_ips.csv"
         report_json.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         report_md.write_text(self.render_markdown(report), encoding="utf-8")
-        self.write_csv(report["suspicious_ips"], ip_csv, ["ip", "score", "requests", "max_rps", "unique_paths", "reason_tags"])
-        self.write_csv(report["suspicious_uris"], uri_csv, ["uri_path", "score", "requests", "distinct_ips", "max_rps", "max_body_bytes", "reason_tags"])
+        self.write_csv(
+            report["suspicious_ips"],
+            ip_csv,
+            ["ip", "score", "risk_category", "requests", "max_rps", "unique_paths", "object_access_hits", "mutating_sensitive_hits", "reason_tags"],
+        )
+        self.write_csv(
+            report["suspicious_uris"],
+            uri_csv,
+            ["uri_path", "score", "risk_category", "requests", "distinct_ips", "max_rps", "max_body_bytes", "object_access_hits", "mutating_sensitive_hits", "reason_tags"],
+        )
         review_rows = []
         for level in ("priority", "observe"):
             for row in report.get("review_ip_groups", {}).get(level, []):
@@ -959,22 +1155,40 @@ class NginxTraceHunter:
         top_uri = report["summary"].get("top_uri")
         if top_ip:
             lines.append(
-                f"- 最高风险 IP: `{top_ip['ip']}`，评分 `{top_ip['score']}`，请求 `{top_ip['requests']}`，原因 `{', '.join(top_ip['reason_tags'])}`"
+                f"- 最高风险 IP: `{top_ip['ip']}`，类型 `{top_ip.get('risk_category', '-')}`，评分 `{top_ip['score']}`，请求 `{top_ip['requests']}`，原因 `{', '.join(top_ip['reason_tags'])}`"
             )
         if top_uri:
             lines.append(
-                f"- 最高风险 URI: `{top_uri['uri_path']}`，评分 `{top_uri['score']}`，请求 `{top_uri['requests']}`，最大响应 `{top_uri['max_body_bytes']}`"
+                f"- 最高风险 URI: `{top_uri['uri_path']}`，类型 `{top_uri.get('risk_category', '-')}`，评分 `{top_uri['score']}`，请求 `{top_uri['requests']}`，最大响应 `{top_uri['max_body_bytes']}`"
             )
         for item in report["summary"].get("hot_windows", [])[:8]:
             lines.append(f"- 热点时间窗: `{item['time_bucket']}` `{item['uri_path']}` 次数 `{item['count']}`")
         lines.append("")
 
+        if report["summary"].get("monitor_targets"):
+            lines.append("## 监控目标汇总")
+            lines.append("")
+            for item in report["summary"]["monitor_targets"][: min(self.config.top_n, 10)]:
+                lines.append(f"- `{item['target']}` 请求 `{item['requests']}` 文件 `{item['files']}`")
+                for sample_file in item.get("sample_files", [])[:3]:
+                    lines.append(f"  - `{sample_file}`")
+            lines.append("")
+
+        if report["summary"].get("top_files"):
+            lines.append("## 涉及文件")
+            lines.append("")
+            for item in report["summary"]["top_files"][: min(self.config.top_n, 10)]:
+                lines.append(f"- `{item['file']}` 请求 `{item['requests']}` 异常样本 `{item['anomalies']}`")
+            lines.append("")
+
         lines.append("## 高风险 IP")
         lines.append("")
         for item in report["suspicious_ips"][: self.config.top_n]:
             lines.append(
-                f"- `{item['ip']}` 分数 `{item['score']}` 请求 `{item['requests']}` 峰值RPS `{item['max_rps']}` 路径数 `{item['unique_paths']}` 原因 `{', '.join(item['reason_tags'])}`"
+                f"- `{item['ip']}` 类型 `{item.get('risk_category', '-')}` 分数 `{item['score']}` 请求 `{item['requests']}` 峰值RPS `{item['max_rps']}` 路径数 `{item['unique_paths']}` 对象访问 `{item.get('object_access_hits', 0)}` 敏感修改 `{item.get('mutating_sensitive_hits', 0)}` 原因 `{', '.join(item['reason_tags'])}`"
             )
+            if item.get("risk_description"):
+                lines.append(f"  说明: {item['risk_description']}")
             if item["top_paths"]:
                 top_paths = ", ".join(f"{entry['path']}({entry['count']})" for entry in item["top_paths"][:4])
                 lines.append(f"  重点路径: {top_paths}")
@@ -997,8 +1211,10 @@ class NginxTraceHunter:
         lines.append("")
         for item in report["suspicious_uris"][: self.config.top_n]:
             lines.append(
-                f"- `{item['uri_path']}` 分数 `{item['score']}` 请求 `{item['requests']}` 源IP `{item['distinct_ips']}` 峰值RPS `{item['max_rps']}` 最大响应 `{item['max_body_bytes']}`"
+                f"- `{item['uri_path']}` 类型 `{item.get('risk_category', '-')}` 分数 `{item['score']}` 请求 `{item['requests']}` 源IP `{item['distinct_ips']}` 峰值RPS `{item['max_rps']}` 最大响应 `{item['max_body_bytes']}` 对象访问 `{item.get('object_access_hits', 0)}` 敏感修改 `{item.get('mutating_sensitive_hits', 0)}`"
             )
+            if item.get("risk_description"):
+                lines.append(f"  说明: {item['risk_description']}")
             if item["ip_top"]:
                 ip_top = ", ".join(f"{ip}({count})" for ip, count in list(item["ip_top"].items())[:5])
                 lines.append(f"  主要来源: {ip_top}")
@@ -1038,12 +1254,13 @@ class NginxTraceHunter:
         if not api_key or not base_url:
             return "AI 模块未执行：缺少 `OPENAI_API_KEY` 或 `OPENAI_BASE_URL`。"
 
+        ai_prompt = (self.config.ai_prompt or DEFAULT_AI_PROMPT).strip() or DEFAULT_AI_PROMPT
         payload = {
             "model": model,
             "messages": [
                 {
                     "role": "system",
-                    "content": "你是一名经验丰富的应急响应分析师。请根据 nginx 日志聚合结果输出精炼研判：攻击方式、攻击是否疑似成功、后续核查建议、需要优先保护的接口。",
+                    "content": ai_prompt,
                 },
                 {
                     "role": "user",
@@ -1237,6 +1454,53 @@ class NginxTraceHunter:
             "access_log": location.access_log,
         }
 
+    def monitor_target_for_file(self, file_path: Path) -> str:
+        raw_key = str(file_path)
+        cached = self.monitor_target_cache.get(raw_key)
+        if cached is not None:
+            return cached
+        resolved_file = file_path.resolve()
+        file_text = str(resolved_file)
+        cached = self.monitor_target_cache.get(file_text)
+        if cached is not None:
+            self.monitor_target_cache[raw_key] = cached
+            return cached
+
+        for archive in self.archives_used:
+            extract_to = archive.get("extract_to")
+            source_archive = archive.get("archive")
+            if extract_to and source_archive:
+                try:
+                    extract_path = Path(extract_to).resolve()
+                    resolved_file.relative_to(extract_path)
+                    self.monitor_target_cache[raw_key] = source_archive
+                    self.monitor_target_cache[file_text] = source_archive
+                    return source_archive
+                except Exception:
+                    pass
+
+        best_match = ""
+        for raw_input in self.config.inputs:
+            try:
+                input_path = raw_input.resolve()
+            except Exception:
+                input_path = raw_input
+            if input_path.is_file():
+                if resolved_file == input_path:
+                    return str(raw_input)
+                continue
+            try:
+                resolved_file.relative_to(input_path)
+                candidate = str(raw_input)
+                if len(candidate) > len(best_match):
+                    best_match = candidate
+            except Exception:
+                continue
+        result = best_match or file_text
+        self.monitor_target_cache[raw_key] = result
+        self.monitor_target_cache[file_text] = result
+        return result
+
     def consume_record(self, item: dict[str, Any]) -> None:
         ip = item["real_ip"]
         uri_path = item["uri_path"]
@@ -1261,6 +1525,10 @@ class NginxTraceHunter:
 
         self.date_counter[date_key] += 1
         self.attack_windows[(hour_key, uri_path)] += 1
+        self.file_request_counts[item["source_file"]] += 1
+        monitor_target = self.monitor_target_for_file(Path(item["source_file"]))
+        self.target_request_counts[monitor_target] += 1
+        self.target_file_map[monitor_target].add(item["source_file"])
 
         ip_stat = self.ip_stats[ip]
         ip_stat.total += 1
@@ -1281,6 +1549,12 @@ class NginxTraceHunter:
             ip_stat.scan_hits += 1
         if self.is_auth_path(uri_path):
             ip_stat.auth_hits += 1
+        object_access = self.is_object_access_event(item)
+        mutating_sensitive = self.is_mutating_sensitive_event(item)
+        if object_access:
+            ip_stat.object_access_hits += 1
+        if mutating_sensitive:
+            ip_stat.mutating_sensitive_hits += 1
         ip_stat.add_sample(sample)
 
         uri_stat = self.uri_stats[uri_path]
@@ -1295,6 +1569,10 @@ class NginxTraceHunter:
         uri_stat.max_rps = max(uri_stat.max_rps, uri_stat.second_counts[second_key])
         for key in item["query_params"].keys():
             uri_stat.query_param_names[key] += 1
+        if object_access:
+            uri_stat.object_access_hits += 1
+        if mutating_sensitive:
+            uri_stat.mutating_sensitive_hits += 1
         uri_stat.add_sample(sample)
 
         pair = self.ip_uri_stats[(ip, uri_path)]
@@ -1330,7 +1608,7 @@ class NginxTraceHunter:
         return True
 
     def parse_access_line(self, line: str, file_path: Path) -> Optional[dict[str, Any]]:
-        match = ACCESS_LOG_RE.match(line.strip())
+        match = ACCESS_LOG_RE.match(line.lstrip("\ufeff").strip())
         if not match:
             return None
 
@@ -1339,10 +1617,14 @@ class NginxTraceHunter:
         uri_path = parsed_target.path or "/"
         query_params = urllib.parse.parse_qs(parsed_target.query, keep_blank_values=True)
         timestamp_raw = match.group("time")
-        try:
-            timestamp = dt.datetime.strptime(timestamp_raw, "%d/%b/%Y:%H:%M:%S %z")
-        except ValueError:
-            return None
+        timestamp = self.timestamp_cache.get(timestamp_raw)
+        if timestamp is None:
+            try:
+                timestamp = dt.datetime.strptime(timestamp_raw, "%d/%b/%Y:%H:%M:%S %z")
+            except ValueError:
+                return None
+            if len(self.timestamp_cache) < 100000:
+                self.timestamp_cache[timestamp_raw] = timestamp
 
         status = int(match.group("status"))
         body_bytes = 0 if match.group("body_bytes") == "-" else int(match.group("body_bytes"))
@@ -1396,12 +1678,23 @@ class NginxTraceHunter:
         extracted_roots: list[Path] = []
         for archive in archives:
             target_dir = extraction_root / archive.stem.replace(".", "_")
+            archive_stat = archive.stat()
+            archive_meta = {
+                "archive": str(archive.resolve()),
+                "size": archive_stat.st_size,
+                "mtime_ns": archive_stat.st_mtime_ns,
+            }
+            meta_path = target_dir / ".nginx_trace_hunter_archive.json"
             log_info(f"处理归档: {archive}")
             if target_dir.exists():
-                extracted_roots.append(target_dir)
-                self.archives_used.append({"archive": str(archive), "extract_to": str(target_dir), "reused": "true"})
-                log_info(f"复用已解压目录: {target_dir}")
-                continue
+                old_meta = load_json_file(meta_path)
+                if old_meta == archive_meta:
+                    extracted_roots.append(target_dir)
+                    self.archives_used.append({"archive": str(archive), "extract_to": str(target_dir), "reused": "true"})
+                    log_info(f"复用已解压目录: {target_dir}")
+                    continue
+                shutil.rmtree(target_dir)
+                log_info(f"归档已变化，重新解压: {archive}")
             ensure_dir(target_dir)
             try:
                 if archive.suffix.lower() == ".zip":
@@ -1414,6 +1707,7 @@ class NginxTraceHunter:
                     self.extract_via_7z(archive, target_dir)
                 else:
                     continue
+                save_json_file(meta_path, archive_meta)
                 extracted_roots.append(target_dir)
                 self.archives_used.append({"archive": str(archive), "extract_to": str(target_dir), "reused": "false"})
                 log_info(f"归档解压完成: {target_dir}")
@@ -1506,6 +1800,73 @@ class NginxTraceHunter:
         lowered = uri_path.lower()
         return any(token in lowered for token in ("/login", "/auth", "/signin", "/token", "/oauth"))
 
+    def path_is_idor_sensitive(self, uri_path: str) -> bool:
+        lowered = uri_path.lower()
+        cached = self.idor_sensitive_cache.get(lowered)
+        if cached is not None:
+            return cached
+        result = any(token in lowered for token in IDOR_PATH_KEYWORDS)
+        if len(self.idor_sensitive_cache) < 100000:
+            self.idor_sensitive_cache[lowered] = result
+        return result
+
+    def path_is_sensitive_list_endpoint(self, uri_path: str) -> bool:
+        lowered = uri_path.lower()
+        cached = self.sensitive_list_cache.get(lowered)
+        if cached is not None:
+            return cached
+        if not self.path_is_idor_sensitive(lowered):
+            result = False
+            if len(self.sensitive_list_cache) < 100000:
+                self.sensitive_list_cache[lowered] = result
+            return result
+        compact = re.sub(r"[^a-z0-9]+", "", lowered)
+        result = any(token in compact or token in lowered for token in LIST_ENDPOINT_KEYWORDS)
+        if len(self.sensitive_list_cache) < 100000:
+            self.sensitive_list_cache[lowered] = result
+        return result
+
+    def classify_risk_tags(self, reason_tags: Iterable[str]) -> tuple[str, str]:
+        tags = set(reason_tags)
+        if tags & {"sensitive-list-access", "bulk-enumeration", "id-enumeration", "object-id-access"}:
+            return "应急增量-疑似越权/枚举", "新增日志命中敏感业务列表、对象 ID 访问或枚举行为，优先核查该来源 IP 是否有合法会话和授权范围。"
+        if tags & {"sensitive-mutation"}:
+            return "应急增量-敏感变更接口", "新增日志命中敏感业务写操作或对象修改接口，优先确认是否为授权用户正常操作。"
+        if tags & {"scan-probe", "auth-burst", "server-error-touch"}:
+            return "扫描探测", "疑似目录/接口探测、认证探测或错误触发，需要结合 UA、状态码和来源 IP 判断是否为扫描器。"
+        if tags & {"sensitive-path"}:
+            return "应急增量-敏感接口访问", "新增日志命中后台、审批、导入导出等敏感接口，建议确认来源 IP、账号和访问时间是否符合业务预期。"
+        if tags & {"large-response", "large-response-spread"}:
+            return "应急增量-异常回包", "新增日志出现异常大响应，需核查是否存在数据导出、批量查询或信息泄露。"
+        if tags & {"burst", "high-frequency", "multi-source"}:
+            return "应急增量-突发访问", "新增日志出现短时间高频或多来源访问，需判断是否为批量脚本、压测或异常客户端。"
+        return "应急增量-待研判", "新增日志达到风险阈值，建议结合源 IP、账号会话、接口权限和业务时间窗复核。"
+
+    def has_sensitive_object_selector(self, item: dict[str, Any]) -> bool:
+        for key, values in item["query_params"].items():
+            if SENSITIVE_PARAM_RE.search(key) and any(str(value).strip() for value in values):
+                return True
+        return bool(item["path_numeric_ids"] and self.path_is_idor_sensitive(item["uri_path"]))
+
+    def is_object_access_event(self, item: dict[str, Any]) -> bool:
+        if item["status"] >= 400:
+            return False
+        if self.is_static_asset(item["uri_path"]):
+            return False
+        return self.has_sensitive_object_selector(item)
+
+    def is_mutating_sensitive_event(self, item: dict[str, Any]) -> bool:
+        if item["method"] not in MUTATING_METHODS:
+            return False
+        if item["status"] >= 500:
+            return False
+        if self.is_static_asset(item["uri_path"]):
+            return False
+        has_selector = self.has_sensitive_object_selector(item)
+        if item["method"] == "POST" and self.path_is_sensitive_list_endpoint(item["uri_path"]) and not has_selector:
+            return False
+        return self.path_is_idor_sensitive(item["uri_path"]) or has_selector
+
     def is_access_log(self, path: Path) -> bool:
         name = path.name.lower()
         if not name.endswith(".log"):
@@ -1558,6 +1919,14 @@ class ResidentAgent:
         state["interval_sec"] = self.config.interval_sec
         state["roots"] = [str(p) for p in self.config.inputs]
         state["search_roots"] = [str(p) for p in self.config.search_roots]
+        old_state = load_json_file(self.config.state_file)
+        old_compare = dict(old_state)
+        new_compare = dict(state)
+        old_compare.pop("last_cycle", None)
+        new_compare.pop("last_cycle", None)
+        if old_compare == new_compare:
+            log_info("状态无实质变化，跳过保存。")
+            return
         self.config.state_file.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
         log_info(f"状态已保存: {self.config.state_file}")
 
@@ -1575,6 +1944,58 @@ class ResidentAgent:
         log_info("执行完整日志发现。")
         hunter = NginxTraceHunter(self.config)
         return hunter.discover_log_files()
+
+    def inspect_incremental_file(self, path: Path, meta: dict[str, Any]) -> dict[str, Any]:
+        total = 0
+        duplicate_recent = 0
+        max_event_ts = meta.get("last_event_ts")
+        recent = set(meta.get("recent_fingerprints") or [])
+        fingerprints: list[str] = []
+        for encoding in TEXT_ENCODING_CANDIDATES:
+            try:
+                with path.open("r", encoding=encoding, errors="strict") as f:
+                    for raw_line in f:
+                        line = raw_line.strip()
+                        if not line:
+                            continue
+                        total += 1
+                        fingerprint = log_line_fingerprint(line)
+                        fingerprints.append(fingerprint)
+                        if fingerprint in recent:
+                            duplicate_recent += 1
+                        match = ACCESS_LOG_RE.match(line.lstrip("\ufeff"))
+                        if match:
+                            timestamp_raw = match.group("time")
+                            try:
+                                timestamp = dt.datetime.strptime(timestamp_raw, "%d/%b/%Y:%H:%M:%S %z").isoformat()
+                                if not max_event_ts or timestamp > max_event_ts:
+                                    max_event_ts = timestamp
+                            except ValueError:
+                                pass
+                break
+            except UnicodeDecodeError:
+                total = 0
+                duplicate_recent = 0
+                max_event_ts = meta.get("last_event_ts")
+                fingerprints = []
+                continue
+        previous_ts = meta.get("last_event_ts")
+        duplicate_ratio = duplicate_recent / total if total else 0.0
+        replay_like = bool(total and previous_ts and max_event_ts and max_event_ts <= previous_ts and duplicate_ratio >= 0.8)
+        return {
+            "total_lines": total,
+            "duplicate_recent": duplicate_recent,
+            "duplicate_ratio": duplicate_ratio,
+            "max_event_ts": max_event_ts,
+            "recent_fingerprints": fingerprints[-500:],
+            "replay_like": replay_like,
+        }
+
+    def merge_recent_fingerprints(self, old_values: list[str], new_values: list[str], limit: int = 500) -> list[str]:
+        merged = list(old_values or []) + list(new_values or [])
+        if len(merged) <= limit:
+            return merged
+        return merged[-limit:]
 
     def build_incremental_batch(self, log_files: list[Path], state: dict[str, Any]) -> list[Path]:
         batch_dir = ensure_dir(self.batch_root / dt.datetime.now().strftime("%Y%m%d_%H%M%S"))
@@ -1597,13 +2018,14 @@ class ResidentAgent:
                 log_info(f"新日志首次接管，仅从尾部开始。file={log_path} offset={offset} size={size}")
 
             if size <= offset:
-                known_logs[key] = {
-                    "offset": size,
-                    "size": size,
-                    "service": file_name_service(log_path),
-                    "last_seen": dt.datetime.now().astimezone().isoformat(),
-                    "bootstrap_from_tail": bool(is_new and size > self.config.bootstrap_bytes),
-                }
+                if is_new or meta.get("size") != size or meta.get("missing"):
+                    known_logs[key] = {
+                        "offset": size,
+                        "size": size,
+                        "service": file_name_service(log_path),
+                        "last_seen": dt.datetime.now().astimezone().isoformat(),
+                        "bootstrap_from_tail": bool(is_new and size > self.config.bootstrap_bytes),
+                    }
                 continue
 
             file_dir = ensure_dir(batch_dir / f"{len(batch_files):04d}")
@@ -1615,7 +2037,25 @@ class ResidentAgent:
                     if not chunk:
                         break
                     dst.write(chunk)
-            if out_path.stat().st_size > 0:
+            inspection = self.inspect_incremental_file(out_path, meta)
+            recent_fingerprints = self.merge_recent_fingerprints(
+                meta.get("recent_fingerprints") or [],
+                inspection.get("recent_fingerprints") or [],
+            )
+            if inspection.get("replay_like"):
+                try:
+                    out_path.unlink()
+                    if not any(file_dir.iterdir()):
+                        file_dir.rmdir()
+                except Exception:
+                    pass
+                log_info(
+                    "跳过疑似重复粘贴/历史回放增量: "
+                    f"file={log_path} lines={inspection.get('total_lines', 0)} "
+                    f"duplicate_ratio={inspection.get('duplicate_ratio', 0):.2f} "
+                    f"last_event_ts={meta.get('last_event_ts')} max_event_ts={inspection.get('max_event_ts')}"
+                )
+            elif out_path.stat().st_size > 0:
                 batch_files.append(out_path)
                 log_info(f"生成增量批文件: {out_path} bytes={out_path.stat().st_size}")
 
@@ -1625,6 +2065,9 @@ class ResidentAgent:
                 "service": file_name_service(log_path),
                 "last_seen": dt.datetime.now().astimezone().isoformat(),
                 "bootstrap_from_tail": bool(is_new and size > self.config.bootstrap_bytes),
+                "last_event_ts": inspection.get("max_event_ts") or meta.get("last_event_ts"),
+                "recent_fingerprints": recent_fingerprints,
+                "last_replay_skipped": bool(inspection.get("replay_like")),
             }
 
         for key, meta in known_logs.items():
@@ -1658,6 +2101,7 @@ class ResidentAgent:
             ai_base_url=self.config.ai_base_url,
             ai_model=self.config.ai_model,
             ai_api_key=self.config.ai_api_key,
+            ai_prompt=self.config.ai_prompt,
             max_search_files=self.config.max_search_files,
             mode="once",
             interval_sec=self.config.interval_sec,
@@ -1716,18 +2160,43 @@ class ResidentAgent:
         top_ip = (report.get("summary", {}) or {}).get("top_ip") or {}
         top_uri = (report.get("summary", {}) or {}).get("top_uri") or {}
         hot = ((report.get("summary", {}) or {}).get("hot_windows") or [])[:3]
+        alert_source = "应急增量告警" if report.get("resident_agent") else "手动/历史扫描告警"
+        risk_category = top_uri.get("risk_category") or top_ip.get("risk_category") or "待研判"
+        risk_description = top_uri.get("risk_description") or top_ip.get("risk_description") or ""
+        sample_events = (top_uri.get("sample_events") or top_ip.get("sample_events") or [])[:3]
         review_groups = report.get("review_ip_groups") or {}
         priority_ips = [item.get("ip", "") for item in review_groups.get("priority", [])[:10] if item.get("ip")]
         observe_ips = [item.get("ip", "") for item in review_groups.get("observe", [])[:10] if item.get("ip")]
         lines = [
-            "Nginx Hunter 告警",
+            f"Nginx Hunter {alert_source}",
+            f"风险类型: {risk_category}",
             f"评分: {score}",
+            f"扫描文件数: {len(report.get('log_files', []))}",
             f"高风险IP: {top_ip.get('ip', '-')}",
             f"高风险URI: {top_uri.get('uri_path', '-')}",
             f"请求量: {top_uri.get('requests', 0)}",
             f"峰值RPS: {top_uri.get('max_rps', 0)}",
+            f"原因标签: {', '.join(top_uri.get('reason_tags') or top_ip.get('reason_tags') or [])}",
             f"输出目录: {self.config.output_dir}",
         ]
+        if risk_description:
+            lines.append(f"说明: {risk_description}")
+        if sample_events:
+            lines.append("样本请求:")
+            for sample in sample_events:
+                lines.append(
+                    f"- {sample.get('timestamp', '-')} {sample.get('real_ip', '-')} {sample.get('method', '-')} {sample.get('target', '-')} status={sample.get('status', '-')}"
+                )
+        monitor_targets = ((report.get("summary", {}) or {}).get("monitor_targets") or [])[:5]
+        if monitor_targets:
+            lines.append("监控目标:")
+            for item in monitor_targets:
+                lines.append(f"- {Path(item.get('target', '')).name or item.get('target', '-')} req={item.get('requests', 0)} files={item.get('files', 0)}")
+        top_files = ((report.get("summary", {}) or {}).get("top_files") or [])[:5]
+        if top_files:
+            lines.append("涉及文件:")
+            for item in top_files:
+                lines.append(f"- {Path(item.get('file', '')).name} req={item.get('requests', 0)} anomaly={item.get('anomalies', 0)}")
         if priority_ips:
             lines.append(f"高优先级研判IP: {','.join(priority_ips)}")
         if observe_ips:
@@ -1774,13 +2243,13 @@ def parse_args(argv: list[str]) -> AnalyzerConfig:
     )
     parser.add_argument("inputs", nargs="*", help="软件根目录、日志目录、单个日志文件或归档文件路径。默认当前目录。")
     parser.add_argument("--once", action="store_true", help="只执行一轮，不驻场。")
-    parser.add_argument("--interval", type=int, default=600, help="驻场轮询间隔秒数，默认 600。")
+    parser.add_argument("--interval", type=int, default=None, help="驻场轮询间隔秒数，默认读取配置或 600。")
     parser.add_argument("--ai", action="store_true", help="开启 AI 二次研判。默认关闭，且只在有明显风险时触发。")
     parser.add_argument("--gui", action="store_true", help="打开图形界面。")
     parser.add_argument("--cfg", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--search-root", action="append", default=[], help=argparse.SUPPRESS)
     parser.add_argument("--output-dir", default=None, help="输出目录。默认在当前目录下自动创建 `hunter_output`。")
-    parser.add_argument("--top", type=int, default=20, help=argparse.SUPPRESS)
+    parser.add_argument("--top", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--focus-ip", action="append", default=[], help=argparse.SUPPRESS)
     parser.add_argument("--focus-uri", action="append", default=[], help=argparse.SUPPRESS)
     parser.add_argument("--from-date", help=argparse.SUPPRESS)
@@ -1788,16 +2257,16 @@ def parse_args(argv: list[str]) -> AnalyzerConfig:
     parser.add_argument(
         "--archive-mode",
         choices=("auto", "never"),
-        default="auto",
+        default=None,
         help=argparse.SUPPRESS,
     )
     parser.add_argument("--ai-base-url", help=argparse.SUPPRESS)
     parser.add_argument("--ai-model", help=argparse.SUPPRESS)
     parser.add_argument("--ai-api-key", help=argparse.SUPPRESS)
-    parser.add_argument("--max-search-files", type=int, default=5000, help=argparse.SUPPRESS)
+    parser.add_argument("--max-search-files", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--state-file", default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--bootstrap-bytes", type=int, default=64 * 1024 * 1024, help=argparse.SUPPRESS)
-    parser.add_argument("--discover-every", type=int, default=12, help=argparse.SUPPRESS)
+    parser.add_argument("--bootstrap-bytes", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--discover-every", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--alert", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--alert-min", type=float, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--ding", default=None, help=argparse.SUPPRESS)
@@ -1830,28 +2299,33 @@ def parse_args(argv: list[str]) -> AnalyzerConfig:
     ai_base_url = args.ai_base_url if args.ai_base_url is not None else stored.get("ai_base_url")
     ai_model = args.ai_model if args.ai_model is not None else stored.get("ai_model")
     ai_api_key = args.ai_api_key if args.ai_api_key is not None else stored.get("ai_api_key")
+    ai_prompt = stored.get("ai_prompt") or DEFAULT_AI_PROMPT
     alert_enabled = bool(args.alert or stored.get("alert_enabled"))
     alert_min_score = float(args.alert_min if args.alert_min is not None else stored.get("alert_min_score", 50.0))
     interval_sec = max(10, int(args.interval if args.interval is not None else stored.get("interval_sec", 600)))
     bootstrap_bytes = max(1024 * 1024, int(args.bootstrap_bytes if args.bootstrap_bytes is not None else stored.get("bootstrap_bytes", 64 * 1024 * 1024)))
     discover_every = max(1, int(args.discover_every if args.discover_every is not None else stored.get("discover_every", 12)))
+    top_n = int(args.top if args.top is not None else stored.get("top_n", 20))
+    archive_mode = args.archive_mode if args.archive_mode is not None else stored.get("archive_mode", "auto")
+    max_search_files = int(args.max_search_files if args.max_search_files is not None else stored.get("max_search_files", 5000))
     mode = "once" if args.once else stored.get("mode", "resident")
     return AnalyzerConfig(
         inputs=inputs,
         search_roots=search_roots,
         output_dir=output_dir,
         cfg_file=cfg_file,
-        top_n=args.top,
+        top_n=top_n,
         focus_ips=set(args.focus_ip),
         focus_uris=args.focus_uri,
-        from_date=parse_date(args.from_date),
-        to_date=parse_date(args.to_date),
-        archive_mode=args.archive_mode,
+        from_date=parse_date(args.from_date if args.from_date is not None else stored.get("from_date")),
+        to_date=parse_date(args.to_date if args.to_date is not None else stored.get("to_date")),
+        archive_mode=archive_mode,
         ai_enabled=ai_enabled,
         ai_base_url=ai_base_url,
         ai_model=ai_model,
         ai_api_key=ai_api_key,
-        max_search_files=args.max_search_files,
+        ai_prompt=ai_prompt,
+        max_search_files=max_search_files,
         mode=mode,
         interval_sec=interval_sec,
         state_file=state_file,
@@ -1881,19 +2355,22 @@ def launch_gui(cfg_path: Optional[Path] = None) -> int:
     log_info(f"启动 GUI。cfg={cfg_path}")
     root = tk.Tk()
     root.title("Nginx Trace Hunter")
-    root.geometry("860x760")
+    root.geometry("980x560")
 
     vars_map: dict[str, Any] = {
-        "inputs": tk.StringVar(value=";".join(stored.get("inputs") or [str(Path.cwd())])),
+        "inputs": tk.StringVar(value=path_list_text(stored.get("inputs") or [str(Path.cwd())])),
         "out": tk.StringVar(value=stored.get("output_dir") or str(default_output_dir())),
         "interval": tk.StringVar(value=str(stored.get("interval_sec", 600))),
         "bootstrap_mb": tk.StringVar(value=str(int(stored.get("bootstrap_bytes", 64 * 1024 * 1024) / (1024 * 1024)))),
         "discover_every": tk.StringVar(value=str(stored.get("discover_every", 12))),
         "state": tk.StringVar(value=stored.get("state_file") or str((default_output_dir() / "hunter_agent.json").resolve())),
+        "from_date": tk.StringVar(value=stored.get("from_date") or ""),
+        "to_date": tk.StringVar(value=stored.get("to_date") or ""),
         "ai": tk.BooleanVar(value=bool(stored.get("ai_enabled"))),
         "ai_base": tk.StringVar(value=stored.get("ai_base_url") or ""),
         "ai_model": tk.StringVar(value=stored.get("ai_model") or ""),
         "ai_key": tk.StringVar(value=stored.get("ai_api_key") or ""),
+        "ai_prompt": tk.StringVar(value=stored.get("ai_prompt") or DEFAULT_AI_PROMPT),
         "alert": tk.BooleanVar(value=bool(stored.get("alert_enabled"))),
         "alert_min": tk.StringVar(value=str(stored.get("alert_min_score", 50.0))),
         "ding": tk.StringVar(value=stored.get("ding_url") or ""),
@@ -1906,28 +2383,149 @@ def launch_gui(cfg_path: Optional[Path] = None) -> int:
         tk.Label(parent, text=label, anchor="w").grid(row=row, column=0, sticky="w", padx=8, pady=6)
         tk.Entry(parent, textvariable=var, width=width, show="*" if secret else "").grid(row=row, column=1, sticky="we", padx=8, pady=6)
 
+    def add_text_row(parent: tk.Widget, row: int, label: str, var: Any, height: int = 5) -> Any:
+        tk.Label(parent, text=label, anchor="nw").grid(row=row, column=0, sticky="nw", padx=8, pady=6)
+        text = tk.Text(parent, height=height, width=90, wrap="word")
+        text.grid(row=row, column=1, sticky="we", padx=8, pady=6)
+        text.insert("1.0", var.get())
+
+        def sync_var(_event: Any = None) -> None:
+            var.set(text.get("1.0", "end-1c"))
+
+        text.bind("<KeyRelease>", sync_var)
+        text.bind("<FocusOut>", sync_var)
+        return text
+
+    def add_list_row(parent: tk.Widget, row: int, label: str, var: Any, height: int = 5) -> Any:
+        tk.Label(parent, text=label, anchor="nw").grid(row=row, column=0, sticky="nw", padx=8, pady=6)
+        frame = tk.Frame(parent)
+        frame.grid(row=row, column=1, sticky="nsew", padx=8, pady=6)
+        frame.grid_columnconfigure(0, weight=1)
+        listbox = tk.Listbox(frame, height=height, exportselection=False)
+        scrollbar = tk.Scrollbar(frame, orient="vertical", command=listbox.yview)
+        listbox.configure(yscrollcommand=scrollbar.set)
+        listbox.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        for item in split_path_list(var.get()):
+            listbox.insert("end", item)
+        return listbox
+
+    def parse_date_text(value: str) -> Optional[dt.date]:
+        value = value.strip()
+        if not value:
+            return None
+        return dt.datetime.strptime(value, "%Y-%m-%d").date()
+
+    def open_date_picker(target_var: Any) -> None:
+        initial = target_var.get().strip()
+        if initial:
+            try:
+                shown = dt.datetime.strptime(initial, "%Y-%m-%d").date()
+            except ValueError:
+                shown = dt.date.today()
+        else:
+            shown = dt.date.today()
+
+        popup = tk.Toplevel(root)
+        popup.title("选择日期")
+        popup.geometry("320x300")
+        popup.transient(root)
+        popup.grab_set()
+
+        current = {"year": shown.year, "month": shown.month}
+        header_var = tk.StringVar()
+        body = tk.Frame(popup)
+        body.pack(fill="both", expand=True, padx=8, pady=8)
+
+        def render_calendar() -> None:
+            for widget in body.winfo_children():
+                widget.destroy()
+            year = current["year"]
+            month = current["month"]
+            header_var.set(f"{year}-{month:02d}")
+
+            top = tk.Frame(body)
+            top.pack(fill="x", pady=4)
+            tk.Button(top, text="<", width=4, command=prev_month).pack(side="left")
+            tk.Label(top, textvariable=header_var, width=16).pack(side="left", expand=True)
+            tk.Button(top, text=">", width=4, command=next_month).pack(side="right")
+
+            week = tk.Frame(body)
+            week.pack(fill="x", pady=4)
+            for name in ["一", "二", "三", "四", "五", "六", "日"]:
+                tk.Label(week, text=name, width=4).pack(side="left", expand=True)
+
+            cal = calendar.Calendar(firstweekday=0)
+            for row in cal.monthdayscalendar(year, month):
+                line = tk.Frame(body)
+                line.pack(fill="x")
+                for day in row:
+                    if day == 0:
+                        tk.Label(line, text="", width=4).pack(side="left", expand=True)
+                    else:
+                        tk.Button(
+                            line,
+                            text=str(day),
+                            width=4,
+                            command=lambda d=day: choose_date(year, month, d),
+                        ).pack(side="left", expand=True)
+
+            foot = tk.Frame(body)
+            foot.pack(fill="x", pady=8)
+            tk.Button(foot, text="清空", command=lambda: clear_date()).pack(side="left", padx=4)
+            tk.Button(foot, text="今天", command=lambda: choose_date(dt.date.today().year, dt.date.today().month, dt.date.today().day)).pack(side="left", padx=4)
+            tk.Button(foot, text="关闭", command=popup.destroy).pack(side="right", padx=4)
+
+        def choose_date(year: int, month: int, day: int) -> None:
+            target_var.set(f"{year:04d}-{month:02d}-{day:02d}")
+            popup.destroy()
+
+        def clear_date() -> None:
+            target_var.set("")
+            popup.destroy()
+
+        def prev_month() -> None:
+            month = current["month"] - 1
+            year = current["year"]
+            if month < 1:
+                month = 12
+                year -= 1
+            current["year"] = year
+            current["month"] = month
+            render_calendar()
+
+        def next_month() -> None:
+            month = current["month"] + 1
+            year = current["year"]
+            if month > 12:
+                month = 1
+                year += 1
+            current["year"] = year
+            current["month"] = month
+            render_calendar()
+
+        render_calendar()
+
+    def add_date_row(parent: tk.Widget, row: int, label: str, var: Any) -> None:
+        tk.Label(parent, text=label, anchor="w").grid(row=row, column=0, sticky="w", padx=8, pady=6)
+        wrap = tk.Frame(parent)
+        wrap.grid(row=row, column=1, sticky="we", padx=8, pady=6)
+        wrap.grid_columnconfigure(0, weight=1)
+        tk.Entry(wrap, textvariable=var, width=40).grid(row=0, column=0, sticky="we")
+        tk.Button(wrap, text="选日期", width=10, command=lambda: open_date_picker(var)).grid(row=0, column=1, padx=6)
+
     frm = tk.Frame(root)
     frm.pack(fill="both", expand=True, padx=10, pady=10)
     frm.grid_columnconfigure(1, weight=1)
+    frm.grid_rowconfigure(0, weight=1)
 
-    add_row(frm, 0, "扫描根目录", vars_map["inputs"])
-    add_row(frm, 1, "输出目录", vars_map["out"])
-    add_row(frm, 2, "状态文件", vars_map["state"])
-    add_row(frm, 3, "轮询秒数", vars_map["interval"], width=20)
-    add_row(frm, 4, "首次接管尾部MB", vars_map["bootstrap_mb"], width=20)
-    add_row(frm, 5, "重新发现日志轮数", vars_map["discover_every"], width=20)
-
-    tk.Checkbutton(frm, text="启用 AI 研判", variable=vars_map["ai"]).grid(row=6, column=0, sticky="w", padx=8, pady=6)
-    add_row(frm, 7, "AI Base URL", vars_map["ai_base"])
-    add_row(frm, 8, "AI Model", vars_map["ai_model"])
-    add_row(frm, 9, "AI Key", vars_map["ai_key"], secret=True)
-
-    tk.Checkbutton(frm, text="启用告警", variable=vars_map["alert"]).grid(row=10, column=0, sticky="w", padx=8, pady=6)
-    add_row(frm, 11, "告警阈值", vars_map["alert_min"], width=20)
-    add_row(frm, 12, "钉钉 Webhook", vars_map["ding"])
-    add_row(frm, 13, "钉钉关键词", vars_map["ding_kw"])
-    add_row(frm, 14, "企微 Webhook", vars_map["wx"])
-    add_row(frm, 15, "飞书 Webhook", vars_map["fs"])
+    inputs_list = add_list_row(frm, 0, "监控日志目录/文件", vars_map["inputs"], height=5)
+    tk.Label(
+        frm,
+        text="提示：这里维护多个监控目标。目录、单个日志、压缩包都可以加入；输出、日期、AI、告警等在“配置设置”里修改。",
+        anchor="w",
+        fg="#555",
+    ).grid(row=1, column=0, columnspan=2, sticky="we", padx=8, pady=6)
 
     status_var = tk.StringVar(value=f"配置文件: {cfg_path}")
     tk.Label(root, textvariable=status_var, anchor="w").pack(fill="x", padx=10, pady=4)
@@ -1938,8 +2536,28 @@ def launch_gui(cfg_path: Optional[Path] = None) -> int:
     def current_log_path() -> Path:
         return current_output_dir() / "hunter.log"
 
+    def listbox_items(listbox: Any) -> list[str]:
+        return [listbox.get(i) for i in range(listbox.size())]
+
+    def sync_inputs_var() -> None:
+        value = path_list_text(listbox_items(inputs_list))
+        if vars_map["inputs"].get() != value:
+            vars_map["inputs"].set(value)
+
+    def add_input_path(path: str) -> None:
+        path = path.strip()
+        if not path:
+            return
+        existing = listbox_items(inputs_list)
+        if path in existing:
+            return
+        inputs_list.insert("end", path)
+        sync_inputs_var()
+        auto_save_later()
+
     def build_cli_config() -> AnalyzerConfig:
-        inputs = [Path(x.strip()).expanduser().resolve() for x in vars_map["inputs"].get().split(";") if x.strip()]
+        sync_inputs_var()
+        inputs = [Path(x).expanduser().resolve() for x in split_path_list(vars_map["inputs"].get())]
         if not inputs:
             inputs = [Path.cwd().resolve()]
         out_dir = Path(vars_map["out"].get().strip() or str(default_output_dir())).expanduser().resolve()
@@ -1956,13 +2574,14 @@ def launch_gui(cfg_path: Optional[Path] = None) -> int:
             top_n=20,
             focus_ips=set(),
             focus_uris=[],
-            from_date=None,
-            to_date=None,
+            from_date=parse_date_text(vars_map["from_date"].get()),
+            to_date=parse_date_text(vars_map["to_date"].get()),
             archive_mode="auto",
             ai_enabled=bool(vars_map["ai"].get()),
             ai_base_url=vars_map["ai_base"].get().strip() or None,
             ai_model=vars_map["ai_model"].get().strip() or None,
             ai_api_key=vars_map["ai_key"].get().strip() or None,
+            ai_prompt=vars_map["ai_prompt"].get().strip() or DEFAULT_AI_PROMPT,
             max_search_files=5000,
             mode="resident",
             interval_sec=max(10, int(vars_map["interval"].get().strip() or "600")),
@@ -1985,12 +2604,111 @@ def launch_gui(cfg_path: Optional[Path] = None) -> int:
         status_var.set(f"已保存: {config.cfg_file}")
         return config
 
+    save_after_id: Optional[str] = None
+    is_saving = False
+
+    def auto_save_later(_name: str = "", _index: str = "", _mode: str = "") -> None:
+        nonlocal save_after_id
+        if is_saving:
+            return
+        if save_after_id:
+            root.after_cancel(save_after_id)
+        save_after_id = root.after(800, auto_save_now)
+
+    def auto_save_now() -> None:
+        nonlocal save_after_id, is_saving
+        save_after_id = None
+        if is_saving:
+            return
+        try:
+            is_saving = True
+            config = build_cli_config()
+            new_data = config_to_persist_dict(config)
+            old_data = load_json_file(config.cfg_file)
+            if old_data == new_data:
+                return
+            save_json_file(config.cfg_file, new_data)
+            status_var.set(f"已自动保存: {dt.datetime.now().strftime('%H:%M:%S')} {config.cfg_file}")
+            log_info(f"GUI 自动保存配置: {config.cfg_file}")
+        except Exception as exc:
+            status_var.set(f"自动保存失败: {exc}")
+            log_error(f"GUI 自动保存失败: {exc}\n{traceback.format_exc()}")
+        finally:
+            is_saving = False
+
+    for key, var in vars_map.items():
+        if hasattr(var, "trace_add"):
+            var.trace_add("write", auto_save_later)
+
     def choose_root() -> None:
         path = filedialog.askdirectory()
         if path:
-            current = [x for x in vars_map["inputs"].get().split(";") if x.strip()]
-            current.append(path)
-            vars_map["inputs"].set(";".join(current))
+            add_input_path(path)
+
+    def choose_input_file() -> None:
+        path = filedialog.askopenfilename(
+            filetypes=[
+                ("日志/归档", "*.log *.txt *.zip *.tar *.tgz *.gz *.7z *.rar"),
+                ("All", "*.*"),
+            ]
+        )
+        if path:
+            add_input_path(path)
+
+    def edit_input_path() -> None:
+        selection = inputs_list.curselection()
+        if not selection:
+            messagebox.showwarning("未选择", "请先选择一个监控目标。")
+            return
+        index = selection[0]
+        old_value = inputs_list.get(index)
+        path = filedialog.askdirectory(title="选择新的监控目录")
+        if not path:
+            path = filedialog.askopenfilename(
+                title="或选择新的日志/归档文件",
+                filetypes=[
+                    ("日志/归档", "*.log *.txt *.zip *.tar *.tgz *.gz *.7z *.rar"),
+                    ("All", "*.*"),
+                ],
+            )
+        if path and path != old_value:
+            inputs_list.delete(index)
+            inputs_list.insert(index, path)
+            inputs_list.selection_set(index)
+            sync_inputs_var()
+            auto_save_later()
+
+    def remove_input_path() -> None:
+        selection = list(inputs_list.curselection())
+        if not selection:
+            messagebox.showwarning("未选择", "请先选择要删除的监控目标。")
+            return
+        for index in reversed(selection):
+            inputs_list.delete(index)
+        sync_inputs_var()
+        auto_save_later()
+
+    def clear_input_paths() -> None:
+        if inputs_list.size() and not messagebox.askyesno("确认清空", "确定清空所有监控目标吗？"):
+            return
+        inputs_list.delete(0, "end")
+        sync_inputs_var()
+        auto_save_later()
+
+    def move_input_path(delta: int) -> None:
+        selection = inputs_list.curselection()
+        if not selection:
+            return
+        index = selection[0]
+        new_index = index + delta
+        if new_index < 0 or new_index >= inputs_list.size():
+            return
+        value = inputs_list.get(index)
+        inputs_list.delete(index)
+        inputs_list.insert(new_index, value)
+        inputs_list.selection_set(new_index)
+        sync_inputs_var()
+        auto_save_later()
 
     def choose_out() -> None:
         path = filedialog.askdirectory()
@@ -2001,6 +2719,58 @@ def launch_gui(cfg_path: Optional[Path] = None) -> int:
         path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json"), ("All", "*.*")])
         if path:
             vars_map["state"].set(path)
+
+    def open_settings() -> None:
+        popup = tk.Toplevel(root)
+        popup.title("配置设置")
+        popup.geometry("900x760")
+        popup.transient(root)
+
+        canvas = tk.Canvas(popup)
+        scrollbar = tk.Scrollbar(popup, orient="vertical", command=canvas.yview)
+        body = tk.Frame(canvas)
+        body.bind("<Configure>", lambda event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=body, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        body.grid_columnconfigure(1, weight=1)
+
+        add_row(body, 0, "输出目录", vars_map["out"])
+        tk.Button(body, text="选择", width=10, command=choose_out).grid(row=0, column=2, padx=6)
+        add_row(body, 1, "状态文件", vars_map["state"])
+        tk.Button(body, text="选择", width=10, command=choose_state).grid(row=1, column=2, padx=6)
+        add_row(body, 2, "轮询秒数", vars_map["interval"], width=20)
+        add_row(body, 3, "首次接管尾部MB", vars_map["bootstrap_mb"], width=20)
+        add_row(body, 4, "重新发现日志轮数", vars_map["discover_every"], width=20)
+        add_date_row(body, 5, "起始日期", vars_map["from_date"])
+        add_date_row(body, 6, "结束日期", vars_map["to_date"])
+        tk.Label(
+            body,
+            text="说明：运行一次 = 按日期范围做全量分析；启动驻场 = 增量巡检。",
+            anchor="w",
+            fg="#555",
+        ).grid(row=7, column=0, columnspan=3, sticky="w", padx=8, pady=6)
+
+        tk.Checkbutton(body, text="启用 AI 研判", variable=vars_map["ai"]).grid(row=8, column=0, sticky="w", padx=8, pady=6)
+        add_row(body, 9, "AI Base URL", vars_map["ai_base"])
+        add_row(body, 10, "AI Model", vars_map["ai_model"])
+        add_row(body, 11, "AI Key", vars_map["ai_key"], secret=True)
+        ai_prompt_text = add_text_row(body, 12, "AI 提示词", vars_map["ai_prompt"], height=6)
+        ai_prompt_text.bind("<KeyRelease>", lambda event: (vars_map["ai_prompt"].set(ai_prompt_text.get("1.0", "end-1c")), auto_save_later()))
+        ai_prompt_text.bind("<FocusOut>", lambda event: (vars_map["ai_prompt"].set(ai_prompt_text.get("1.0", "end-1c")), auto_save_later()))
+
+        tk.Checkbutton(body, text="启用告警", variable=vars_map["alert"]).grid(row=13, column=0, sticky="w", padx=8, pady=6)
+        add_row(body, 14, "告警阈值", vars_map["alert_min"], width=20)
+        add_row(body, 15, "钉钉 Webhook", vars_map["ding"])
+        add_row(body, 16, "钉钉关键词", vars_map["ding_kw"])
+        add_row(body, 17, "企微 Webhook", vars_map["wx"])
+        add_row(body, 18, "飞书 Webhook", vars_map["fs"])
+
+        foot = tk.Frame(body)
+        foot.grid(row=19, column=0, columnspan=3, sticky="e", padx=8, pady=12)
+        tk.Button(foot, text="保存", width=10, command=save_cfg).pack(side="left", padx=4)
+        tk.Button(foot, text="关闭", width=10, command=popup.destroy).pack(side="left", padx=4)
 
     def launch_subprocess(once: bool) -> None:
         config = save_cfg()
@@ -2034,14 +2804,22 @@ def launch_gui(cfg_path: Optional[Path] = None) -> int:
 
     btn = tk.Frame(root)
     btn.pack(fill="x", padx=10, pady=10)
-    tk.Button(btn, text="添加根目录", command=choose_root, width=12).pack(side="left", padx=4)
-    tk.Button(btn, text="输出目录", command=choose_out, width=12).pack(side="left", padx=4)
-    tk.Button(btn, text="状态文件", command=choose_state, width=12).pack(side="left", padx=4)
-    tk.Button(btn, text="保存配置", command=save_cfg, width=12).pack(side="left", padx=4)
-    tk.Button(btn, text="打开日志", command=open_log_file, width=12).pack(side="left", padx=4)
-    tk.Button(btn, text="打开输出", command=open_output_dir, width=12).pack(side="left", padx=4)
-    tk.Button(btn, text="运行一次", command=lambda: launch_subprocess(True), width=12).pack(side="left", padx=4)
-    tk.Button(btn, text="启动驻场", command=lambda: launch_subprocess(False), width=12).pack(side="left", padx=4)
+    tk.Button(btn, text="添加目录", command=choose_root, width=10).pack(side="left", padx=3)
+    tk.Button(btn, text="添加文件", command=choose_input_file, width=10).pack(side="left", padx=3)
+    tk.Button(btn, text="编辑目标", command=edit_input_path, width=10).pack(side="left", padx=3)
+    tk.Button(btn, text="删除目标", command=remove_input_path, width=10).pack(side="left", padx=3)
+    tk.Button(btn, text="上移", command=lambda: move_input_path(-1), width=6).pack(side="left", padx=3)
+    tk.Button(btn, text="下移", command=lambda: move_input_path(1), width=6).pack(side="left", padx=3)
+    tk.Button(btn, text="清空", command=clear_input_paths, width=6).pack(side="left", padx=3)
+
+    btn2 = tk.Frame(root)
+    btn2.pack(fill="x", padx=10, pady=4)
+    tk.Button(btn2, text="配置设置", command=open_settings, width=12).pack(side="left", padx=4)
+    tk.Button(btn2, text="保存配置", command=save_cfg, width=12).pack(side="left", padx=4)
+    tk.Button(btn2, text="打开日志", command=open_log_file, width=12).pack(side="left", padx=4)
+    tk.Button(btn2, text="打开输出", command=open_output_dir, width=12).pack(side="left", padx=4)
+    tk.Button(btn2, text="运行一次", command=lambda: launch_subprocess(True), width=12).pack(side="left", padx=4)
+    tk.Button(btn2, text="启动驻场", command=lambda: launch_subprocess(False), width=12).pack(side="left", padx=4)
 
     root.mainloop()
     return 0
@@ -2049,14 +2827,16 @@ def launch_gui(cfg_path: Optional[Path] = None) -> int:
 
 def main(argv: list[str]) -> int:
     try:
+        configure_console_encoding()
         config = parse_args(argv)
         log_path = setup_logging(config.output_dir if not config.gui_mode else default_output_dir())
         log_info(f"程序启动。platform={platform.system()} python={sys.version.split()[0]} argv={' '.join(argv)}")
         log_info(f"日志文件: {log_path}")
         if config.gui_mode:
             return launch_gui(config.cfg_file)
-        save_json_file(config.cfg_file, config_to_persist_dict(config))
-        log_info(f"配置已持久化: {config.cfg_file}")
+        if "--cfg" in argv:
+            save_json_file(config.cfg_file, config_to_persist_dict(config))
+            log_info(f"配置已持久化: {config.cfg_file}")
         if config.mode == "resident":
             print(f"驻场模式启动。根目录: {', '.join(str(p) for p in config.inputs)}")
             print(f"状态文件: {config.state_file}")
@@ -2067,6 +2847,10 @@ def main(argv: list[str]) -> int:
             return agent.loop()
         hunter = NginxTraceHunter(config)
         report = hunter.run()
+        if config.alert_enabled:
+            state = load_json_file(config.state_file)
+            ResidentAgent(config).send_alert_if_needed(report, state)
+            save_json_file(config.state_file, state)
         print(json.dumps(report["summary"], ensure_ascii=False, indent=2))
         print(f"报告已输出到: {config.output_dir}")
         print(f"运行日志: {config.output_dir / 'hunter.log'}")
