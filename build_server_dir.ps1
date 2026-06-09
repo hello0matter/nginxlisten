@@ -39,6 +39,7 @@ if (-not (Test-Path $Exe)) {
 
 $AppDir = Join-Path $Dist "nginx-trace-hunter-server"
 Copy-Item (Join-Path $Root "config.example.windows.json") $AppDir -ErrorAction SilentlyContinue
+Copy-Item (Join-Path $Root "install_windows_task.ps1") $AppDir -ErrorAction SilentlyContinue
 Copy-Item (Join-Path $Root "README.md") $AppDir -ErrorAction SilentlyContinue
 
 Write-Host "Creating zip package..."

@@ -38,6 +38,7 @@ tar -a -c -f (Join-Path $Dist "nginx-trace-hunter-source.zip") `
     build_linux_centos.sh `
     build_linux_portable.ps1 `
     install_linux_service.sh `
+    install_windows_task.ps1 `
     linux_setup.sh `
     config.example.linux.json `
     config.example.windows.json `
