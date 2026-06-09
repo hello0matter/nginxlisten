@@ -20,7 +20,6 @@ tar -czf (Join-Path $Dist "nginx-trace-hunter-linux-source.tar.gz") `
     build_linux_portable.ps1 `
     install_linux_service.sh `
     linux_setup.sh `
-    linux_manage.sh `
     config.example.linux.json `
     config.example.windows.json `
     README.md
@@ -41,7 +40,6 @@ tar -a -c -f (Join-Path $Dist "nginx-trace-hunter-source.zip") `
     install_linux_service.sh `
     install_windows_task.ps1 `
     linux_setup.sh `
-    linux_manage.sh `
     config.example.linux.json `
     config.example.windows.json `
     README.md
